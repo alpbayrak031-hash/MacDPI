@@ -58,10 +58,17 @@ That's the whole install — there's nothing to install alongside it.
 
 - 🌐 **Covers every browser at once** — Safari, Chrome, Edge, Brave, Arc,
   Firefox — via the macOS system proxy, not a per-tab extension.
-- 🧠 **`auto` mode learns per host** — it tries each evasion strategy until the
-  server genuinely answers, then remembers the winner for that hostname.
-- 🕵️ **DNS-over-HTTPS built in** — Cloudflare, Google, Quad9, AdGuard, or any
-  custom resolver; addressed by IP so no plaintext lookup bootstraps it.
+- 🧠 **`auto` mode verifies and adapts** — it probes every strategy at once and
+  picks the one whose TLS certificate actually validates against the real CAs,
+  so it can tell the true server from an intercepting firewall's forged cert and
+  never caches a strategy that only reaches the middlebox. It re-checks when a
+  network changes.
+- 🧠 **learns per host** — once verified, the winning strategy is cached so
+  later visits are instant; a host that's genuinely blocked on every strategy
+  (packet drop or handshake reset) is detected fast and flagged as needing a VPN.
+- 🕵️ **Resilient DNS-over-HTTPS** — Cloudflare, Google, Quad9, AdGuard; it falls
+  through providers *and* evasion strategies until one resolves, verifying the
+  resolver's own certificate, so a blocked resolver doesn't take DNS down.
 - 📊 **Menu-bar dashboard** — live connection counts, data moved, per-strategy
   usage, recent sites, and the current DoH resolver.
 - 🧪 **"Test This Network"** — probes each strategy against real sites and tells
@@ -86,9 +93,14 @@ That's the whole install — there's nothing to install alongside it.
 | `split` | A single TCP split through the middle of the hostname. |
 | `direct` | No evasion — the fallback for sites that aren't filtered. |
 
-In **`auto`** mode (the default) these are tried in order until a real
-ServerHello comes back, and the winner is cached per host in
-`~/.macdpi/learned.json`.
+In **`auto`** mode (the default) these are probed **concurrently**, and the one
+whose certificate validates against the real CAs wins — that's how it tells the
+true server from an intercepting firewall, which answers with a valid-looking
+handshake and a forged certificate. The winner is cached per host in
+`~/.macdpi/learned.json`, and re-checked when it stops working.
+
+> 📖 See **[docs/GUIDE.md](docs/GUIDE.md)** for the full reference — every menu
+> item, all CLI flags, how the transparent mode works, and the honest limits.
 
 ---
 

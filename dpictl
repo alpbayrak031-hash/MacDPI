@@ -1,0 +1,355 @@
+#!/bin/bash
+# dpictl - start/stop macdpi and point macOS at it.
+#
+# The system proxy settings are what make this cover every tab in Safari,
+# Chrome, Edge, Brave and Arc at once, rather than one window or one extension.
+
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE="$HOME/.macdpi"
+PIDFILE="$STATE/macdpi.pid"
+LOGFILE="$STATE/macdpi.log"
+PLIST="$HOME/Library/LaunchAgents/com.macdpi.proxy.plist"
+LABEL="com.macdpi.proxy"
+TARGET="gui/$(id -u)/$LABEL"
+
+PORT="${MACDPI_PORT:-8881}"
+HOST="127.0.0.1"
+# How long the login-time launch waits for Wi-Fi to actually route before it
+# starts serving. It listens either way; this only avoids a burst of failures.
+WAIT_FOR_NETWORK="${MACDPI_WAIT:-300}"
+BYPASS=(*.local 169.254/16 127.0.0.1 localhost ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16)
+
+PY="$(command -v python3 || true)"
+[ -n "$PY" ] || { echo "dpictl: python3 not found"; exit 1; }
+
+mkdir -p "$STATE"
+
+c_ok()  { printf '\033[32m%s\033[0m\n' "$*"; }
+c_bad() { printf '\033[31m%s\033[0m\n' "$*"; }
+c_dim() { printf '\033[2m%s\033[0m\n' "$*"; }
+
+# --- network services ------------------------------------------------------
+
+services() {
+  # Skip the header line and any service marked disabled with a leading '*'.
+  networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | grep -v '^\*' || true
+}
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Changing the system proxy needs administrator rights."
+    exec sudo -p "Password for %u: " "$0" "$@"
+  fi
+}
+
+# --- launch agent ----------------------------------------------------------
+
+agent_installed() { [ -f "$PLIST" ]; }
+agent_loaded()    { launchctl print "$TARGET" >/dev/null 2>&1; }
+
+# Wait for a previous instance to finish unloading. bootout is asynchronous,
+# and a job that is on its way out still reports as loaded - taking that for
+# success is how you end up with no proxy running at all.
+agent_unloaded() {
+  local i
+  for i in $(seq 1 20); do
+    agent_loaded || return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# An immediate bootstrap after a bootout fails with EIO, so retry briefly.
+agent_bootstrap() {
+  agent_loaded && return 0
+  local i
+  for i in $(seq 1 8); do
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && return 0
+    sleep 1
+    agent_loaded && return 0
+  done
+  launchctl load -w "$PLIST" 2>/dev/null || return 1
+}
+
+write_plist() {
+  mkdir -p "$(dirname "$PLIST")"
+  cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>$PY</string>
+    <string>-m</string>
+    <string>macdpi</string>
+    <string>--port</string>
+    <string>$PORT</string>
+    <string>--wait-for-network</string>
+    <string>$WAIT_FOR_NETWORK</string>
+  </array>
+
+  <key>WorkingDirectory</key><string>$DIR</string>
+
+  <!-- Start at login and stay up. Connectivity is handled inside macdpi
+       rather than with KeepAlive/NetworkState, which current versions of
+       launchd ignore: at startup it waits for a working connection before
+       serving, and it watches for the link dropping and returning. Keeping
+       the process alive while offline is also the kinder failure - browsers
+       get a page that fails and then recovers, instead of "the proxy server
+       refused connections" the moment Wi-Fi blips. -->
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$LOGFILE</string>
+  <key>StandardErrorPath</key><string>$LOGFILE</string>
+</dict>
+</plist>
+PLISTEOF
+}
+
+# --- daemon ----------------------------------------------------------------
+
+running_pid() {
+  [ -f "$PIDFILE" ] || return 1
+  local pid; pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { echo "$pid"; return 0; }
+  return 1
+}
+
+listening() { nc -z "$HOST" "$PORT" 2>/dev/null; }
+
+wait_listening() {
+  local i
+  for i in $(seq 1 30); do
+    listening && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+cmd_start() {
+  if agent_installed; then
+    agent_bootstrap || { c_bad "could not load the launchd agent"; return 1; }
+    launchctl kickstart "$TARGET" >/dev/null 2>&1 || true
+    wait_listening && c_ok "macdpi running on $HOST:$PORT (managed by launchd)" \
+                   || c_bad "launchd did not bring macdpi up; see $LOGFILE"
+    return
+  fi
+  if pid="$(running_pid)"; then
+    c_ok "macdpi already running (pid $pid)"
+    return 0
+  fi
+  cd "$DIR"
+  nohup "$PY" -m macdpi --port "$PORT" "$@" >>"$LOGFILE" 2>&1 &
+  echo $! > "$PIDFILE"
+  sleep 1
+  if pid="$(running_pid)"; then
+    c_ok "macdpi started on $HOST:$PORT (pid $pid)"
+    c_dim "log: $LOGFILE"
+  else
+    c_bad "macdpi failed to start; last lines of $LOGFILE:"
+    tail -n 15 "$LOGFILE" || true
+    return 1
+  fi
+}
+
+cmd_restart() {
+  if agent_installed; then
+    agent_bootstrap || { c_bad "could not load the launchd agent"; return 1; }
+    launchctl kickstart -k "$TARGET" >/dev/null 2>&1 || true
+    wait_listening && c_ok "macdpi restarted on $HOST:$PORT (managed by launchd)" \
+                   || c_bad "launchd did not bring macdpi back; see $LOGFILE"
+    return
+  fi
+  cmd_stop
+  cmd_start "$@"
+}
+
+cmd_stop() {
+  if agent_installed && agent_loaded; then
+    launchctl bootout "$TARGET" 2>/dev/null || true
+    c_ok "macdpi stopped"
+    c_dim "autostart is still installed, so it returns at next login."
+    c_dim "run './dpictl uninstall' to stop that too."
+    return
+  fi
+  if pid="$(running_pid)"; then
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do running_pid >/dev/null || break; sleep 0.2; done
+    running_pid >/dev/null && kill -9 "$pid" 2>/dev/null || true
+    rm -f "$PIDFILE"
+    c_ok "macdpi stopped"
+  else
+    c_dim "macdpi is not running"
+    rm -f "$PIDFILE"
+  fi
+}
+
+# --- system proxy ----------------------------------------------------------
+
+cmd_on() {
+  need_root on
+  local any=0
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    networksetup -setwebproxy          "$svc" "$HOST" "$PORT" || continue
+    networksetup -setsecurewebproxy    "$svc" "$HOST" "$PORT" || continue
+    networksetup -setwebproxystate     "$svc" on
+    networksetup -setsecurewebproxystate "$svc" on
+    networksetup -setproxybypassdomains "$svc" "${BYPASS[@]}"
+    echo "  proxy on  -> $svc"
+    any=1
+  done < <(services)
+  [ "$any" = 1 ] && c_ok "System proxy points at $HOST:$PORT for every active network service." \
+                 || c_bad "No active network services found."
+}
+
+cmd_off() {
+  need_root off
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    networksetup -setwebproxystate       "$svc" off || true
+    networksetup -setsecurewebproxystate "$svc" off || true
+    networksetup -setsocksfirewallproxystate "$svc" off || true
+    echo "  proxy off -> $svc"
+  done < <(services)
+  c_ok "System proxy disabled."
+}
+
+cmd_status() {
+  if agent_installed; then
+    if agent_loaded; then
+      c_ok "daemon:   running via launchd (starts at login)"
+    else
+      c_bad "daemon:   launchd agent installed but not loaded"
+    fi
+  elif pid="$(running_pid)"; then
+    c_ok "daemon:   running (pid $pid)"
+  else
+    c_bad "daemon:   not running"
+  fi
+
+  if listening; then
+    c_ok "listener: accepting connections on $HOST:$PORT"
+  else
+    c_bad "listener: nothing listening on $HOST:$PORT"
+  fi
+
+  if "$PY" - <<'PYCHECK' 2>/dev/null
+import socket, sys
+s = socket.socket(); s.settimeout(3)
+sys.exit(0 if s.connect_ex(("1.1.1.1", 443)) == 0 else 1)
+PYCHECK
+  then c_ok "internet:  reachable"
+  else c_bad "internet:  not reachable"
+  fi
+
+  echo
+  echo "system proxy:"
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    local info state server port
+    info="$(networksetup -getsecurewebproxy "$svc" 2>/dev/null || true)"
+    state="$(awk '/^Enabled:/{print $2}' <<<"$info")"
+    server="$(awk '/^Server:/{print $2}' <<<"$info")"
+    port="$(awk '/^Port:/{print $2}' <<<"$info")"
+    if [ "$state" = "Yes" ]; then
+      c_ok "  $svc: on -> $server:$port"
+    else
+      c_dim "  $svc: off"
+    fi
+  done < <(services)
+
+  if [ -f "$STATE/learned.json" ]; then
+    echo
+    echo "learned strategies: $(grep -c ':' "$STATE/learned.json" 2>/dev/null || echo 0) hosts"
+  fi
+}
+
+# --- autostart -------------------------------------------------------------
+
+# MacDPI.app manages the same launchd label. If it is in charge, say so rather
+# than silently repointing the agent at this folder and having the two fight.
+managed_by_app() {
+  agent_installed || return 1
+  /usr/libexec/PlistBuddy -c "Print :WorkingDirectory" "$PLIST" 2>/dev/null \
+    | grep -q "\.app/Contents/Resources/engine$"
+}
+
+cmd_install() {
+  if managed_by_app; then
+    c_bad "MacDPI.app is already managing the engine on this Mac."
+    c_dim "Use its menu bar item, or move the app to the Trash first."
+    c_dim "Run './dpictl install' again afterwards to take over from the CLI."
+    return 1
+  fi
+  cmd_stop >/dev/null 2>&1 || true
+  write_plist
+  # launchd caches the job definition, so a changed plist must be reloaded
+  # rather than kickstarted - and the old job has to be gone first.
+  launchctl bootout "$TARGET" 2>/dev/null || true
+  agent_unloaded || true
+  agent_bootstrap || { c_bad "could not load the launchd agent"; return 1; }
+  c_ok "macdpi will now start automatically at login."
+  c_dim "At startup it waits up to ${WAIT_FOR_NETWORK}s for a working internet"
+  c_dim "connection before serving, and it keeps watching afterwards: if the"
+  c_dim "link drops or you move to another network it flushes its DNS cache"
+  c_dim "and carries on. launchd restarts it if it ever dies."
+  wait_listening && c_ok "It is running now on $HOST:$PORT." \
+                 || c_dim "Not listening yet - it is waiting for a connection."
+  echo
+  c_dim "The system proxy setting is separate and already persists on its own,"
+  c_dim "so run './dpictl on' once if you have not already."
+}
+
+cmd_uninstall() {
+  launchctl bootout "$TARGET" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
+  rm -f "$PLIST"
+  c_ok "autostart removed."
+}
+
+# --- misc ------------------------------------------------------------------
+
+cmd_test() { cd "$DIR"; "$PY" -m macdpi --test "$@"; }
+cmd_log()  { tail -f "$LOGFILE"; }
+
+usage() {
+  cat <<USAGE
+dpictl - control macdpi
+
+  ./dpictl start [args]   run the proxy in the background
+  ./dpictl stop           stop it
+  ./dpictl restart
+  ./dpictl on             route all of macOS through it   (asks for password)
+  ./dpictl off            restore normal networking       (asks for password)
+  ./dpictl status         what is running and what is routed
+  ./dpictl test [hosts]   probe which evasion strategy this network needs
+  ./dpictl install        start at login, whenever you have internet
+  ./dpictl uninstall      undo that
+  ./dpictl log            follow the log
+
+Set it up once and forget it:
+  ./dpictl install && ./dpictl on
+USAGE
+}
+
+case "${1:-}" in
+  start)     shift; cmd_start "$@" ;;
+  stop)      cmd_stop ;;
+  restart)   shift || true; cmd_restart "$@" ;;
+  on)        cmd_on ;;
+  off)       cmd_off ;;
+  status)    cmd_status ;;
+  test)      shift; cmd_test "$@" ;;
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  log)       cmd_log ;;
+  *)         usage ;;
+esac

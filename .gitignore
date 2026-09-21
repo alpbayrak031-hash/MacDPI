@@ -1,0 +1,16 @@
+# Build output (the app + DMG are published as release assets, not committed)
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Local runtime state (lives in ~/.macdpi, never here, but just in case)
+.macdpi/
+*.log
