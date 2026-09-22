@@ -1,12 +1,18 @@
 import Cocoa
 
 // Only one menu bar instance should exist: launchd may start one at login while
-// the user also opens the app from Finder.
-let alreadyRunning = NSWorkspace.shared.runningApplications.contains {
+// the user also opens the app from Finder. Bail only for a true duplicate -
+// another instance running from the *same* bundle path. A copy at a different
+// path (e.g. the old DMG/translocated instance that is handing off to the
+// freshly installed /Applications one) is on its way out, so let this one take
+// over instead of exiting into nothing.
+let myPath = Bundle.main.bundlePath
+let duplicate = NSWorkspace.shared.runningApplications.contains {
     $0.bundleIdentifier == Bundle.main.bundleIdentifier
         && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        && ($0.bundleURL?.path == myPath)
 }
-if alreadyRunning {
+if duplicate {
     exit(0)
 }
 

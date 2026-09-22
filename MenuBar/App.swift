@@ -14,6 +14,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // If we're running from the DMG, from Downloads, or from a translocated
+        // read-only path (which is where macOS puts a downloaded app after
+        // "Open Anyway"), install into /Applications and relaunch from there.
+        // Otherwise the launchd agents we write would point at a temporary path
+        // that disappears - the app opens but the proxy never actually works.
+        if relocateToApplicationsIfNeeded() { return }
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         menu.delegate = self
         statusItem.menu = menu
@@ -26,6 +33,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+    }
+
+    /// Ensure the app runs from /Applications, not a DMG / Downloads / translocated
+    /// path. Returns true if it kicked off a relocate-and-relaunch (caller should
+    /// stop setting up this instance).
+    private func relocateToApplicationsIfNeeded() -> Bool {
+        let bundlePath = Bundle.main.bundlePath
+        let dest = "/Applications/MacDPI.app"
+        let translocated = bundlePath.contains("/AppTranslocation/")
+                        || bundlePath.contains("/AppleInternal/")
+        let onDMG = bundlePath.hasPrefix("/Volumes/")
+
+        // Already correctly installed and not a read-only translocated copy.
+        if bundlePath == dest && !translocated { return false }
+        // Running from somewhere under /Applications but not the canonical name:
+        // leave it be rather than fight the user's own placement.
+        if bundlePath.hasPrefix("/Applications/") && !translocated && !onDMG {
+            return false
+        }
+
+        let box = NSAlert()
+        box.messageText = "Move MacDPI to your Applications folder?"
+        box.informativeText = """
+        MacDPI needs to run from Applications so it keeps working after you close \
+        it. Right now it's running from a temporary location (\(onDMG ? "the disk image" : "a download / protected path")).
+
+        I'll copy it to Applications and reopen it from there.
+        """
+        box.addButton(withTitle: "Move to Applications")
+        box.addButton(withTitle: "Quit")
+        guard box.runModal() == .alertFirstButtonReturn else {
+            NSApp.terminate(nil)
+            return true
+        }
+
+        // Replace any existing copy, preserving the code signature via ditto.
+        _ = shell("/bin/rm", ["-rf", dest])
+        _ = shell("/usr/bin/ditto", [bundlePath, dest])
+        // Clear quarantine so the relaunched copy isn't itself translocated.
+        _ = shell("/usr/bin/xattr", ["-dr", "com.apple.quarantine", dest])
+
+        guard FileManager.default.fileExists(atPath: dest + "/Contents/MacOS/MacDPI") else {
+            let fail = NSAlert()
+            fail.messageText = "Could not move MacDPI"
+            fail.informativeText = "Please drag MacDPI onto the Applications folder "
+                + "yourself, then open it from there."
+            fail.runModal()
+            NSApp.terminate(nil)
+            return true
+        }
+        // Launch the installed copy and hand off to it.
+        _ = shell("/usr/bin/open", [dest])
+        NSApp.terminate(nil)
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
