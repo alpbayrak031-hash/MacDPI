@@ -38,6 +38,50 @@ cp "$DIR/dpictl" "$APP/Contents/Resources/engine/"
 cp "$DIR/README.md" "$APP/Contents/Resources/"
 find "$APP/Contents/Resources/engine" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
+# --- a self-contained Python travels inside the bundle too -----------------
+# A brand-new Mac has no usable Python (/usr/bin/python3 is a stub that only
+# offers to install the Command Line Tools). So the app carries its own
+# relocatable CPython - one per architecture - and never touches the system.
+
+PY_RELEASE="20260901"
+PY_VER="3.12.14"
+PY_BASE="https://github.com/astral-sh/python-build-standalone/releases/download/$PY_RELEASE"
+CACHE="$DIR/.pycache"
+mkdir -p "$CACHE" "$APP/Contents/Resources/pyruntime"
+
+trim_python() {                       # $1 = a python install dir, trimmed in place
+  local P="$1/lib/python3.12"
+  local d
+  for d in test idlelib turtledemo tkinter lib2to3 ensurepip pydoc_data sqlite3 \
+           dbm distutils site-packages/pip site-packages/setuptools; do
+    rm -rf "$P/$d"
+  done
+  find "$P" -depth -type d \( -name test -o -name tests -o -name __pycache__ \) \
+       -exec rm -rf {} + 2>/dev/null || true
+  find "$P" -maxdepth 1 -type d -name 'config-3.12-*' -exec rm -rf {} + 2>/dev/null || true
+  find "$P/lib-dynload" \( -name '_tkinter*.so' -o -name '_test*.so' \) -delete 2>/dev/null || true
+  find "$1/lib" -maxdepth 1 \( -name 'libtcl*' -o -name 'libtk*' -o -name '*.a' \) -delete 2>/dev/null || true
+  rm -rf "$1/include" "$1/share"
+  ( cd "$1/bin" && rm -f pip pip3 pip3.12 idle3 idle3.12 2to3 2to3-3.12 \
+       pydoc3 pydoc3.12 python3.12-config python3-config ) 2>/dev/null || true
+}
+
+for pair in "arm64 aarch64" "x86_64 x86_64"; do
+  set -- $pair; APPARCH="$1"; PBSARCH="$2"
+  TARBALL="cpython-$PY_VER+$PY_RELEASE-$PBSARCH-apple-darwin-install_only_stripped.tar.gz"
+  if [ ! -f "$CACHE/$TARBALL" ]; then
+    echo "  downloading Python for $APPARCH ($PBSARCH)…"
+    curl -fsSL "$PY_BASE/$TARBALL" -o "$CACHE/$TARBALL"
+  fi
+  echo "  bundling Python for $APPARCH"
+  rm -rf "$CACHE/extract-$APPARCH"; mkdir -p "$CACHE/extract-$APPARCH"
+  tar xzf "$CACHE/$TARBALL" -C "$CACHE/extract-$APPARCH"
+  trim_python "$CACHE/extract-$APPARCH/python"
+  mv "$CACHE/extract-$APPARCH/python" "$APP/Contents/Resources/pyruntime/$APPARCH"
+  rm -rf "$CACHE/extract-$APPARCH"
+done
+echo "  bundled runtime size: $(du -sh "$APP/Contents/Resources/pyruntime" | cut -f1)"
+
 # --- icon ------------------------------------------------------------------
 
 echo "  rendering the icon"
@@ -123,9 +167,11 @@ if [ -z "$IDENTITY" ]; then
               | awk -F'"' '/Developer ID Application/{print $2; exit}')"
 fi
 
+# The bundle now contains nested Mach-O (the two Python runtimes and their C
+# extensions), so signing must be deep - --deep signs every nested binary.
 if [ -n "$IDENTITY" ]; then
   echo "  signing as: $IDENTITY"
-  codesign --force --timestamp --options runtime \
+  codesign --force --deep --timestamp --options runtime \
            --identifier com.macdpi.app \
            --sign "$IDENTITY" "$APP"
   SIGNED_PROPERLY=1
@@ -135,8 +181,8 @@ else
   # seals the bundle against tampering and, with an explicit identifier, keeps
   # the app's identity stable across rebuilds so macOS does not treat each
   # build as a brand new application.
-  echo "  no Developer ID found - signing ad-hoc"
-  codesign --force --identifier com.macdpi.app --sign - "$APP"
+  echo "  no Developer ID found - signing ad-hoc (deep)"
+  codesign --force --deep --identifier com.macdpi.app --sign - "$APP"
   SIGNED_PROPERLY=0
 fi
 

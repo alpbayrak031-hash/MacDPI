@@ -10,6 +10,13 @@ if alreadyRunning {
     exit(0)
 }
 
+// Strip quarantine from our own bundle. When the app is downloaded, every file
+// inside it - including the bundled Python the engine runs on - is flagged
+// com.apple.quarantine, and macOS would block launchd from executing that
+// nested binary with no visible error. The user has already approved opening
+// this app, so clearing the flag on its own contents is safe and expected.
+shell("/usr/bin/xattr", ["-dr", "com.apple.quarantine", Bundle.main.bundlePath])
+
 Installer.repairIfMoved()
 
 let app = NSApplication.shared

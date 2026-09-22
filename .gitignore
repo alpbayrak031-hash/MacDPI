@@ -14,3 +14,6 @@ venv/
 # Local runtime state (lives in ~/.macdpi, never here, but just in case)
 .macdpi/
 *.log
+
+# cached Python runtimes for bundling (build.sh)
+.pycache/

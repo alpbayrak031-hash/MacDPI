@@ -5,8 +5,8 @@
 **A GoodbyeDPI-style DPI-circumvention tool for macOS.**
 
 Unblock censored sites in *every* browser tab — and, optionally, in every app —
-with no kernel extension, no root daemon for the network path, and no
-dependencies beyond the Python that already ships with macOS.
+with no kernel extension, no root daemon for the network path, and **nothing to
+install**: the app is fully self-contained, so a brand-new Mac just runs it.
 
 ![platform](https://img.shields.io/badge/platform-macOS%2012%2B-black)
 ![arch](https://img.shields.io/badge/arch-universal%20(Apple%20Silicon%20%2B%20Intel)-blue)
@@ -187,9 +187,11 @@ the proxy it's already using, but it can't open a Unix socket.
 ## Requirements
 
 - **macOS 12 or later**, Apple Silicon or Intel.
-- **Python 3** — Apple's own `/usr/bin/python3` (Command Line Tools) is enough;
-  the app offers to install it if missing. No packages, no `pip`.
-- Building the app needs the **Command Line Tools** (`xcode-select --install`).
+- **Nothing to install.** The app carries its own Python runtime inside the
+  bundle (one per architecture), so a brand-new Mac needs no Python, no
+  Command Line Tools, no `pip` — you download the app and run it.
+- Building the app from source needs the **Command Line Tools**
+  (`xcode-select --install`); `build.sh` downloads the bundled runtimes for you.
 
 ---
 
