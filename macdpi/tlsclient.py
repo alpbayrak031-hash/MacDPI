@@ -8,6 +8,7 @@ applied to our own ClientHello.
 import os
 import ssl
 
+from . import tls
 from .netio import Upstream
 
 # python.org builds ship no CA bundle of their own; fall back to the one macOS
@@ -57,9 +58,20 @@ class TLSStream:
         data = self._out.read()
         if not data:
             return first_write
-        if first_write and self.strategy is not None:
-            await self.strategy(self.up, data, self.ctx)
-            return False
+        if self.strategy is not None:
+            if first_write:
+                await self.strategy(self.up, data, self.ctx)
+                return False
+            # A second ClientHello (after a HelloRetryRequest) names the host
+            # again, so it gets the same treatment - exactly as the proxy does
+            # for a real client, which keeps a probe honest about whether a
+            # strategy survives that path.
+            offset = tls.find_client_hello(data, self.hostname)
+            if offset is not None:
+                if offset:
+                    await self.up.send(data[:offset])
+                await self.strategy(self.up, data[offset:], self.ctx)
+                return first_write
         await self.up.send(data)
         return first_write
 

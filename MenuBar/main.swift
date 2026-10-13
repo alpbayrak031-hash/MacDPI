@@ -23,8 +23,6 @@ if duplicate {
 // this app, so clearing the flag on its own contents is safe and expected.
 shell("/usr/bin/xattr", ["-dr", "com.apple.quarantine", Bundle.main.bundlePath])
 
-Installer.repairIfMoved()
-
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

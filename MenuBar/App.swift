@@ -21,6 +21,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // that disappears - the app opens but the proxy never actually works.
         if relocateToApplicationsIfNeeded() { return }
 
+        // Only once we know we are the installed copy: doing this from a disk
+        // image would point the engine job at a path that is about to vanish.
+        Installer.bringUpToDate()
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         menu.delegate = self
         statusItem.menu = menu
@@ -270,10 +274,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let current = status?.mode ?? "auto"
         let parent = NSMenuItem(title: "Strategy: \(current)", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
-        let names = ["auto", "tlsfrag", "oob", "tlsfrag+oob", "multisplit+oob",
-                     "multisplit", "split", "direct"]
+        let names = ["auto", "recver", "tlsfrag", "tinyrec", "multirec",
+                     "oob", "tlsfrag+oob", "multisplit+oob",
+                     "multisplit", "split", "disorder", "direct"]
         for name in names {
-            var title = name == "auto" ? "auto (try each, learn)" : name
+            var title = name == "auto" ? "auto (verify each, learn)" : name
             let count = status?.strategies[name] ?? 0
             let item = NSMenuItem(title: title,
                                   action: #selector(setStrategy(_:)), keyEquivalent: "")
@@ -537,12 +542,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let waiting = NSAlert()
         waiting.messageText = "Testing this network…"
         waiting.informativeText = "Trying every evasion strategy against a handful "
-            + "of sites. This takes up to a minute."
+            + "of sites. This takes a few seconds."
         waiting.addButton(withTitle: "Cancel")
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: python)
-        task.arguments = ["-m", "macdpi", "--test"]
+        task.arguments = Paths.pythonOptions + ["-m", "macdpi", "--test"]
         task.currentDirectoryURL = URL(fileURLWithPath: Paths.engineDir)
         let pipe = Pipe()
         task.standardOutput = pipe

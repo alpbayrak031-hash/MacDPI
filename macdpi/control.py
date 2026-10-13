@@ -129,7 +129,7 @@ class ControlServer:
             "uptime": time.time() - self.started,
             "mode": self.ctx.mode,
             "ladder": self.ctx.ladder,
-            "doh": self.ctx.doh_host if self.ctx.doh else None,
+            "doh": self.resolver.active_host,
             "connections": stats["connections"],
             "failed": stats["failed"],
             "active": stats["active"],
@@ -241,15 +241,17 @@ class ControlServer:
 
     def _cmd_flush_dns(self, _request):
         self.resolver.reset()
+        self.proxy.forget_verification()
         self.log.info("DNS cache flushed")
         return {"ok": True}
 
     def _cmd_forget(self, request):
         host = request.get("host")
         if host:
-            self.proxy.learned.pop(host, None)
+            self.proxy._forget(host)
         else:
             self.proxy.learned.clear()
+            self.proxy.forget_verification()
         self.proxy._dirty = True
         self.proxy.save_state()
         self.log.info(f"forgot learned strategy for {host or 'all hosts'}")

@@ -6,6 +6,7 @@ connection straight to a known address.
 """
 
 import asyncio
+import socket
 
 # Well-known anycast resolvers, reachable on 443 from almost anywhere.
 FALLBACK_TARGETS = [("1.1.1.1", 443), ("9.9.9.9", 443), ("208.67.222.222", 443)]
@@ -68,13 +69,66 @@ async def wait_until_online(ctx, log, max_wait: float) -> bool:
     return False
 
 
-async def monitor(ctx, resolver, log, stop, interval: float = 30.0):
-    """Watch for the connection dropping and coming back.
+def _local_address():
+    """The address this Mac would send from right now, or None if offline.
 
-    On the way back, the DNS cache and the DoH circuit breaker are cleared so a
-    laptop waking on a different network does not keep serving stale addresses.
+    "Connecting" a UDP socket transmits nothing; it only makes the kernel pick
+    a route, which reveals the local address on the active interface.
     """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("1.1.1.1", 53))
+        return sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+async def _default_route():
+    """(gateway, interface) of the default route, or None if it has none."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "/sbin/route", "-n", "get", "default",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), 3)
+    except (OSError, asyncio.TimeoutError):
+        return None
+    fields = {}
+    for line in out.decode("latin-1").splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            fields[key.strip()] = value.strip()
+    if "gateway" not in fields:
+        return None
+    return fields["gateway"], fields.get("interface")
+
+
+async def network_identity():
+    """A cheap fingerprint of the network the Mac is attached to."""
+    address = _local_address()
+    if address is None:
+        return None
+    return address, await _default_route()
+
+
+async def monitor(ctx, resolver, log, stop, interval: float = 30.0,
+                  on_change=None):
+    """Watch for the connection dropping, coming back, or moving networks.
+
+    Any of those can put the Mac behind a different filter, so the DNS cache
+    and the DoH circuit breaker are cleared, and `on_change` is called so the
+    proxy stops trusting strategies it verified on the previous network.
+    """
+    def changed(why):
+        log.info(f"{why}; flushing DNS cache and re-verifying strategies")
+        resolver.reset()
+        if on_change is not None:
+            on_change()
+
     online = True
+    network = await network_identity()
     try:
         while not stop.is_set():
             try:
@@ -84,11 +138,15 @@ async def monitor(ctx, resolver, log, stop, interval: float = 30.0):
                 pass
 
             now_online = await is_online(ctx)
+            current = await network_identity()
             if now_online and not online:
-                log.info("internet connection restored; flushing DNS cache")
-                resolver.reset()
+                changed("internet connection restored")
             elif not now_online and online:
                 log.warn("internet connection lost")
+            elif now_online and current is not None and current != network:
+                changed("network changed")
             online = now_online
+            if current is not None:
+                network = current
     except asyncio.CancelledError:
         pass

@@ -5,7 +5,9 @@ every connection is driven through raw sockets instead.
 """
 
 import asyncio
+import errno
 import itertools
+import random
 import socket
 
 # When transparent interception is on, the engine's own upstream connections
@@ -15,7 +17,15 @@ import socket
 # socket binds into that band. See pfgen.py for the matching firewall rule.
 SRC_PORT_LOW = 40000
 SRC_PORT_HIGH = 44999
-_src_port_cycle = itertools.cycle(range(SRC_PORT_LOW, SRC_PORT_HIGH + 1))
+# Start at a random point in the band so that two processes sharing it (the
+# engine and a `--test` run, say) do not walk the same ports in step.
+_SRC_PORTS = list(range(SRC_PORT_LOW, SRC_PORT_HIGH + 1))
+_src_port_start = random.randrange(len(_SRC_PORTS))
+_src_port_cycle = itertools.cycle(
+    _SRC_PORTS[_src_port_start:] + _SRC_PORTS[:_src_port_start])
+
+# connect() errors that mean "this source port is taken for that destination".
+_PORT_CLASH = (errno.EADDRINUSE, errno.EADDRNOTAVAIL)
 
 
 def _bind_reserved_source_port(sock: socket.socket):
@@ -57,22 +67,33 @@ class Upstream:
                       reserve_source_port: bool = False):
         loop = loop or asyncio.get_running_loop()
         family = socket.AF_INET6 if ":" in ip else socket.AF_INET
-        sock = socket.socket(family, socket.SOCK_STREAM)
-        sock.setblocking(False)
-        if reserve_source_port:
-            _bind_reserved_source_port(sock)
-        fd = sock.fileno()
-        try:
-            await asyncio.wait_for(loop.sock_connect(sock, (ip, port)), timeout)
-        except BaseException:
-            # Unregister before closing. A cancelled sock_connect can leave the
-            # descriptor registered with the loop, and closing it out from
-            # under the selector strands a callback that never fires - which
-            # hangs the whole proxy, not just this connection.
-            loop.remove_writer(fd)
-            sock.close()
-            raise
-        return cls(sock, loop)
+        # One source port serves many destinations, but not the same one
+        # twice: once the band has wrapped round, a port may still be carrying
+        # an older connection to this very address, and connect() then fails
+        # with EADDRINUSE. That says nothing about the server, so move on to
+        # the next port rather than report the destination unreachable.
+        attempts = 8 if reserve_source_port else 1
+        for attempt in range(attempts):
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            if reserve_source_port:
+                _bind_reserved_source_port(sock)
+            fd = sock.fileno()
+            try:
+                await asyncio.wait_for(loop.sock_connect(sock, (ip, port)),
+                                       timeout)
+            except BaseException as exc:
+                # Unregister before closing. A cancelled sock_connect can leave
+                # the descriptor registered with the loop, and closing it out
+                # from under the selector strands a callback that never fires -
+                # which hangs the whole proxy, not just this connection.
+                loop.remove_writer(fd)
+                sock.close()
+                if (isinstance(exc, OSError) and exc.errno in _PORT_CLASH
+                        and attempt + 1 < attempts):
+                    continue
+                raise
+            return cls(sock, loop)
 
     async def _writable(self):
         fut = self.loop.create_future()
@@ -107,11 +128,21 @@ class Upstream:
     async def recv(self, n: int = 65536) -> bytes:
         return await self.loop.sock_recv(self.sock, n)
 
-    def set_ttl(self, ttl: int):
+    def _ttl_opt(self):
         if self.sock.family == socket.AF_INET6:
-            self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, ttl)
-        else:
-            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+            return socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS
+        return socket.IPPROTO_IP, socket.IP_TTL
+
+    def get_ttl(self) -> int:
+        try:
+            ttl = self.sock.getsockopt(*self._ttl_opt())
+        except OSError:
+            ttl = 0
+        # IPv6 reports -1 for "use the system default".
+        return ttl if ttl > 0 else 64
+
+    def set_ttl(self, ttl: int):
+        self.sock.setsockopt(*self._ttl_opt(), ttl)
 
     def close(self):
         try:

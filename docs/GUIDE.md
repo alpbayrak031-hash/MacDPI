@@ -108,10 +108,9 @@ It's also undone by *Remove MacDPI*.
 
 `./build.sh` produces `build/MacDPI-<version>.zip`. Send that anywhere.
 
-The app is universal (Apple Silicon and Intel) and carries the engine inside it,
-so there is nothing to install alongside it. It runs on Apple's own Python 3, so
-a stock Mac needs no Python download; if a Mac somehow has none that works, the
-app offers to install Apple's Command Line Tools.
+The app is universal (Apple Silicon and Intel) and carries both the engine and
+its own Python runtime inside it, so there is nothing to install alongside it -
+a brand-new Mac needs no Python and no Command Line Tools.
 
 **Gatekeeper will object the first time.** The app is ad-hoc signed but not
 notarised — that needs a paid Apple Developer account, which this build does not
@@ -160,12 +159,27 @@ completely unchanged.
 
 | Strategy | What it does |
 |---|---|
+| `recver` | Rewrites the *record-layer version* field on the ClientHello to a value no TLS version uses. Servers are required to ignore that field, and it is not part of the handshake transcript, so nothing changes for them - but a filter that recognises TLS by its opening bytes no longer sees TLS at all, and never looks for a hostname. The only technique here that survives a firewall which reassembles everything *and* falls back on the server's certificate when it cannot read the name. Costs nothing: no extra packets. |
 | `tlsfrag` | Splits the ClientHello across two TLS records, cut through the middle of the hostname. Legal per the TLS spec, so servers accept it, but a filter has to reassemble handshake messages across records to recover the name. |
-| `oob` | Splits the hostname and sends one *urgent* (out-of-band) byte into the gap. The server's TCP stack pulls that byte back out; most filters ignore the urgent pointer and read it inline, so they see a corrupted hostname. The only technique here that beats a middlebox which fully reassembles TCP. |
-| `tlsfrag+oob` | Both at once. |
+| `tinyrec` | Puts a single byte of the ClientHello in a record of its own. A filter that can stitch two records together often still needs the first one to hold the whole handshake header before it recognises a ClientHello. |
+| `multirec` | Scatters the ClientHello across six records, three of the cuts through the hostname. For filters that reassemble only a small, fixed number of fragments. |
+| `oob` | Splits the hostname and sends one *urgent* (out-of-band) byte into the gap. The server's TCP stack pulls that byte back out; most filters ignore the urgent pointer and read it inline, so they see a corrupted hostname. Beats a middlebox that fully reassembles TCP, but some servers (Google's, Apple's, anything on Windows) mishandle urgent data. |
+| `tlsfrag+oob` | Record fragmentation and the urgent byte at once. |
+| `multisplit+oob` | Several small TCP segments and the urgent byte. |
 | `multisplit` | Chops the first packet into several small TCP segments around the hostname. |
 | `split` | A single TCP split through the middle of the hostname. |
+| `disorder` | Sends the first half of the hostname with a TTL too small to leave your router, so it is lost, and the second half normally - then the kernel retransmits the first. The server reorders as TCP always does; a filter reading packets in arrival order sees the tail before the head. Costs one retransmission delay. |
 | `direct` | No evasion — the fallback for sites that aren't filtered. |
+
+No one of these wins everywhere, and that is the point of having several. On
+one real network a firewall that reassembled every fragment was beaten only by
+`recver`; on another, hours later, the filter ignored the record version
+completely and only the fragmentation family got through.
+
+If a server answers the first ClientHello with a HelloRetryRequest, the client
+sends a second one - hostname and all. macdpi spots it and gives it the same
+treatment, so a filter that follows the handshake does not get on the second
+try what it was denied on the first.
 
 Plaintext HTTP additionally gets GoodbyeDPI's classic header tricks (`hOSt:`
 with padded whitespace), which servers treat identically and filter rules
@@ -174,18 +188,46 @@ usually don't match.
 **DNS is handled too.** Blocking by forged DNS answers is at least as common as
 SNI filtering, so macdpi resolves names itself over DNS-over-HTTPS, addressing
 the resolver by IP so no plaintext lookup is ever needed. Your browser needs no
-DNS changes.
+DNS changes. Networks that filter by SNI tend to block the well-known DoH
+resolvers too, so the connection to the resolver gets the same evasion as
+everything else, its certificate is verified, and if one provider cannot be
+reached macdpi moves on to the next - several providers, and more than one
+address for each.
 
 ### `auto` mode
 
-By default macdpi doesn't make you pick. It tries each strategy in turn until
-the server returns a genuine TLS ServerHello, then remembers the winner for that
-hostname in `~/.macdpi/learned.json`, so later visits go straight there.
+By default macdpi doesn't make you pick. The first time it meets a host it
+probes **every** strategy, and uses the highest-ranked one whose certificate
+validates against the real certificate authorities. The winner is remembered
+for that hostname in `~/.macdpi/learned.json`, so later visits go straight
+there.
 
-A reply that isn't a handshake record — a TLS alert, or the plaintext junk some
-front-ends emit — counts as a failure and moves on. This matters: a few
-front-ends (Azure's among them) deliver the urgent byte inline and mangle the
-hello, and without that check the browser would inherit a broken connection.
+Checking the certificate, rather than just "did a handshake come back", is what
+makes this work against a firewall that intercepts instead of resetting: such a
+box answers with a perfectly valid handshake and a forged certificate, and a
+strategy that only reaches *it* must not be mistaken for one that works.
+
+A few details make this hold up in practice:
+
+- **Probes run together, staggered.** Each starts a beat after the last, so a
+  network needing no evasion settles on the first having barely started the
+  rest, while a hostile one gets through the whole ladder in under a second.
+  Probes that are being silently dropped are not waited for.
+- **A remembered strategy is re-checked before it is trusted again** - once
+  per run, whenever the network changes, and periodically in the background. A
+  strategy that has gone stale does not fail: it quietly starts delivering the
+  interceptor's certificate. So "it worked last time" is never taken on faith.
+- **Failure heals in place.** If a verified strategy stops working, macdpi
+  re-selects while the client is still waiting and carries on with the new
+  one, instead of failing the connection and leaving the app to retry.
+- **A client hanging up mid-handshake is treated as evidence.** macdpi cannot
+  see a forged certificate go past (it never decrypts anything), but it can
+  see a client receive the server's reply and immediately give up - so it
+  re-checks the strategy before the next connection uses it.
+
+If nothing validates because every strategy is reset or dropped, the host is
+beyond what any local trick can do, and macdpi says so quickly rather than
+making you wait.
 
 ## Finding out what your network does
 
@@ -193,9 +235,10 @@ hello, and without that check the browser would inherit a broken connection.
 ./dpictl test
 ```
 
-This completes a real TLS handshake to each host with every strategy and prints
-a grid of what got through, then names the one that works best. Pass your own
-hostnames to test specific sites:
+This completes a real, certificate-verified TLS handshake to each host with
+every strategy, and says for each site whether it is open, filtered (and which
+strategies get through), or blocked outright - then scores the strategies. It
+takes a few seconds. Pass your own hostnames to test specific sites:
 
 ```bash
 ./dpictl test example.com another.example
@@ -216,9 +259,10 @@ after the first restart. Instead:
   connection to a known address rather than by resolving a name, because on a
   half-up or captive network DNS is precisely the thing that hangs.
 - **While running** it watches the connection. When the link drops and comes
-  back — a lid closed, a different Wi-Fi network — it flushes its DNS cache and
-  re-arms DoH, so a laptop that wakes somewhere else doesn't keep using stale
-  addresses.
+  back, or the Mac moves to a different network — a lid closed, another Wi-Fi —
+  it flushes its DNS cache, re-arms DoH, and stops trusting the strategies it
+  verified on the previous network, so a laptop that wakes somewhere else
+  doesn't keep using stale addresses or stale assumptions.
 - **If it ever dies** launchd restarts it.
 
 Keeping the process alive while offline is deliberate. With the system proxy
@@ -249,7 +293,8 @@ Useful options to `start`:
 ```
 -m, --mode STRATEGY   force one strategy instead of auto
     --delay 0.05      pause between split segments, if splitting alone fails
-    --doh google      switch resolver (cloudflare, google, quad9, adguard, URL, or off)
+    --doh google      switch resolver (cloudflare, google, opendns, adguard,
+                      dnssb, nextdns, controld, a URL, or off)
     --port 8881       change the listen port
 -v, --verbose         log every connection and the strategy it used
     --wait-for-network 300   wait N seconds for a connection before serving
@@ -292,17 +337,18 @@ MenuBar/Paths.swift   locating a Python that actually runs
 MenuBar/Installer.swift  writing and repairing the launchd jobs
 build.sh              builds the universal, self-contained MacDPI.app
 
-macdpi/tls.py         ClientHello parsing, TLS record fragmentation
-macdpi/desync.py      the evasion strategies
+macdpi/tls.py         ClientHello parsing, TLS record re-framing
+macdpi/desync.py      the evasion strategies and their order of preference
 macdpi/netio.py       non-blocking sockets with MSG_OOB and TTL access
 macdpi/tlsclient.py   MemoryBIO TLS client, so DoH gets evasion too
-macdpi/dns.py         DNS-over-HTTPS resolver with cache and fallback
-macdpi/proxy.py       HTTP CONNECT + plaintext HTTP + SOCKS5, retry ladder
-macdpi/netcheck.py    reachability checks for startup and network changes
+macdpi/dns.py         DNS-over-HTTPS resolver: providers, fallback, cache
+macdpi/proxy.py       HTTP CONNECT + plaintext HTTP + SOCKS5, verified
+                      strategy selection
+macdpi/netcheck.py    reachability and network-change detection
 macdpi/control.py     Unix-socket control channel for the menu bar
 macdpi/transparent... transparent routing lives in proxy.handle_transparent
 macdpi/pfgen.py       generates the pf ruleset for 'cover all apps'
-macdpi/probe.py       the --test grid
+macdpi/probe.py       the --test report
 macdpi/config.py      options and logging
 dpictl                start/stop, system proxy, autostart
 ```

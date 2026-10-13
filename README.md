@@ -58,16 +58,20 @@ That's the whole install — there's nothing to install alongside it.
 
 - 🌐 **Covers every browser at once** — Safari, Chrome, Edge, Brave, Arc,
   Firefox — via the macOS system proxy, not a per-tab extension.
-- 🧠 **`auto` mode verifies and adapts** — it probes every strategy at once and
-  picks the one whose TLS certificate actually validates against the real CAs,
-  so it can tell the true server from an intercepting firewall's forged cert and
-  never caches a strategy that only reaches the middlebox. It re-checks when a
-  network changes.
-- 🧠 **learns per host** — once verified, the winning strategy is cached so
-  later visits are instant; a host that's genuinely blocked on every strategy
-  (packet drop or handshake reset) is detected fast and flagged as needing a VPN.
-- 🕵️ **Resilient DNS-over-HTTPS** — Cloudflare, Google, Quad9, AdGuard; it falls
-  through providers *and* evasion strategies until one resolves, verifying the
+- 🧠 **`auto` mode verifies and adapts** — it probes every strategy and picks
+  the one whose TLS certificate actually validates against the real CAs, so it
+  can tell the true server from an intercepting firewall's forged cert and
+  never caches a strategy that only reaches the middlebox.
+- 🩹 **Self-healing** — a remembered strategy is re-checked before it's trusted
+  again (each run, on every network change, and periodically), and if one stops
+  working mid-session the engine re-selects while the app is still waiting, so
+  sign-ins and API calls don't see an error.
+- ⚡ **Fast first contact** — probes run together and ones being silently
+  dropped aren't waited for; a host that's genuinely blocked on every strategy
+  is detected quickly and flagged as needing a VPN.
+- 🕵️ **Resilient DNS-over-HTTPS** — Cloudflare, Google, OpenDNS, AdGuard, DNS.SB,
+  NextDNS, Control D, with more than one address each; it falls through
+  providers *and* evasion strategies until one resolves, verifying the
   resolver's own certificate, so a blocked resolver doesn't take DNS down.
 - 📊 **Menu-bar dashboard** — live connection counts, data moved, per-strategy
   usage, recent sites, and the current DoH resolver.
@@ -86,18 +90,24 @@ That's the whole install — there's nothing to install alongside it.
 
 | Strategy | What it does |
 |---|---|
+| `recver` | Rewrites the ClientHello's *record-layer version* to a value no TLS version uses. Servers must ignore that field (and it isn't in the handshake transcript), but a filter that recognises TLS by its opening bytes no longer sees TLS at all. Free - no extra packets - and the only technique here that survives a firewall which reassembles everything *and* falls back on the server's certificate. |
 | `tlsfrag` | Splits the ClientHello across two TLS records, cut through the middle of the hostname. Legal per the spec, so servers accept it; a filter must reassemble handshake messages across records to recover the name. |
-| `oob` | Splits the hostname and sends one *urgent* (out-of-band) byte into the gap. The server's TCP stack removes it; most filters read it inline and see a corrupted hostname. The only technique here that also beats a middlebox which fully reassembles TCP. |
-| `tlsfrag+oob` | Both at once. |
+| `tinyrec` | Puts one byte of the ClientHello in a record of its own, for filters that only recognise a ClientHello when the first record holds the whole handshake header. |
+| `multirec` | Scatters the ClientHello across six records, for filters that reassemble only a few fragments. |
+| `oob` | Splits the hostname and sends one *urgent* (out-of-band) byte into the gap. The server's TCP stack removes it; most filters read it inline and see a corrupted hostname. Some servers mishandle urgent data. |
+| `tlsfrag+oob`, `multisplit+oob` | The urgent byte combined with record or TCP fragmentation. |
 | `multisplit` | Chops the first packet into several small TCP segments around the hostname. |
 | `split` | A single TCP split through the middle of the hostname. |
+| `disorder` | Makes the two halves of the hostname arrive out of order, using a TTL too small for the first half to leave your router. |
 | `direct` | No evasion — the fallback for sites that aren't filtered. |
 
-In **`auto`** mode (the default) these are probed **concurrently**, and the one
-whose certificate validates against the real CAs wins — that's how it tells the
-true server from an intercepting firewall, which answers with a valid-looking
-handshake and a forged certificate. The winner is cached per host in
-`~/.macdpi/learned.json`, and re-checked when it stops working.
+No single strategy wins everywhere: on one real network only `recver` got
+through, and on another the filter ignored it and only the fragmentation family
+worked. So in **`auto`** mode (the default) every strategy is probed, and the
+highest-ranked one whose certificate validates against the real CAs wins —
+that's how it tells the true server from an intercepting firewall, which answers
+with a valid-looking handshake and a forged certificate. The winner is cached
+per host in `~/.macdpi/learned.json`, and re-checked before it's trusted again.
 
 > 📖 See **[docs/GUIDE.md](docs/GUIDE.md)** for the full reference — every menu
 > item, all CLI flags, how the transparent mode works, and the honest limits.
@@ -151,8 +161,8 @@ Run the engine directly for one-off use or debugging:
 ```bash
 python3 -m macdpi -v                 # foreground, verbose
 python3 -m macdpi --test             # probe strategies against a few sites
-python3 -m macdpi --doh quad9        # switch resolver
-python3 -m macdpi -m oob             # force one strategy instead of auto
+python3 -m macdpi --doh google       # switch resolver
+python3 -m macdpi -m recver          # force one strategy instead of auto
 ```
 
 ---
@@ -166,12 +176,13 @@ MenuBar/            native Swift menu-bar app (universal binary)
   System.swift        system-proxy, launchd, and pf handling
   Installer.swift     writes/repairs the launchd jobs
 macdpi/             the engine (Python 3, standard library only)
-  tls.py              ClientHello parsing + TLS record fragmentation
+  tls.py              ClientHello parsing + TLS record re-framing
   desync.py           the evasion strategies
-  netio.py            non-blocking sockets with MSG_OOB + source-port control
+  netio.py            non-blocking sockets with MSG_OOB, TTL + source-port control
   tlsclient.py        MemoryBIO TLS client (so DoH gets evasion too)
-  dns.py              DNS-over-HTTPS resolver with cache + fallback
-  proxy.py            HTTP CONNECT + plaintext HTTP + SOCKS5 + transparent mode
+  dns.py              DNS-over-HTTPS resolver: providers, fallback, cache
+  proxy.py            HTTP CONNECT + plaintext HTTP + SOCKS5 + transparent mode,
+                      verified strategy selection
   pfgen.py            generates the pf ruleset for "cover all apps"
   control.py          Unix-socket control channel for the menu bar
 build.sh            builds the signed, universal MacDPI.app

@@ -29,6 +29,14 @@ REC_ALERT = 0x15
 # Mac's own outbound traffic - which is the one thing that cannot be verified
 # without actually loading the firewall rules.
 SELFTEST_SNI = "macdpi-selftest.invalid"
+# A client that has sent no more than this after its ClientHello, then hangs
+# up, never finished the handshake: a TLS 1.3 alert is ~30 bytes on the wire
+# and a TLS 1.2 one 7, while the smallest genuine second flight is ~60.
+ABORT_BYTES = 48
+# How many of the client's chunks after the first are checked for a second
+# ClientHello. It can only come before any application data, so it is always
+# among the very first.
+HELLO_WATCH_CHUNKS = 3
 HOP_HEADERS = {b"proxy-connection", b"proxy-authorization", b"connection",
                b"keep-alive", b"upgrade", b"te", b"trailer"}
 
@@ -59,6 +67,16 @@ class Proxy:
         # complete). Kept briefly so we fail fast instead of grinding through
         # the whole ladder on a dead address.
         self._unreachable = {}
+        # When each host's cached strategy was last seen to reach the real
+        # server (monotonic clock). Deliberately not persisted: a pick learned
+        # on an earlier run, or on another network, is re-checked with a single
+        # probe before it is trusted again, because a strategy that has gone
+        # stale does not fail - it quietly delivers the interceptor's forged
+        # certificate instead.
+        self._verified_at = {}
+        # Strong references to fire-and-forget tasks, which the event loop
+        # itself holds only weakly.
+        self._background = set()
 
     # --- dispatch ----------------------------------------------------------
 
@@ -178,6 +196,7 @@ class Proxy:
         if not first:
             return
 
+        first = await _complete_record(reader, first)
         looks_tls = tls.is_client_hello(first)
         try:
             up, pending, name = await self._open(
@@ -193,7 +212,9 @@ class Proxy:
         if pending:
             writer.write(pending)
             await writer.drain()
-        await self._relay(reader, writer, up)
+        await self._relay(reader, writer, up, host=host,
+                          strategy=name if looks_tls else None,
+                          received=len(pending))
 
     # --- transparent interception -----------------------------------------
 
@@ -212,6 +233,8 @@ class Proxy:
             if not first:
                 return
 
+            strategy = None
+            first = await _complete_record(reader, first)
             if tls.is_client_hello(first):
                 host = tls.sni_host(first)
                 if host == SELFTEST_SNI:
@@ -227,6 +250,7 @@ class Proxy:
                     return
                 up, pending, name = await self._open(
                     host, upstream_port, first, tls_expected=True)
+                strategy = name
             else:
                 host = _http_host(first)
                 if not host:
@@ -240,7 +264,8 @@ class Proxy:
             if pending:
                 writer.write(pending)
                 await writer.drain()
-            await self._relay(reader, writer, up)
+            await self._relay(reader, writer, up, host=host, strategy=strategy,
+                              received=len(pending))
         except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError):
             pass
         except Exception as exc:                              # noqa: BLE001
@@ -260,36 +285,52 @@ class Proxy:
             raise ConnectionError(f"no address for {host}")
         ips = ips[:self.ctx.max_ips]
 
-        verified_pick = None
         if http:
-            order = ["http"]
-        elif tls_expected and self._is_auto():
-            # A "did I get a handshake back?" success check is fooled by an
-            # intercepting middlebox, which answers with its own valid handshake
-            # and a forged certificate. So for auto mode we choose the strategy
-            # by cert validation instead (see _select_strategy) and cache it.
-            now = time.time()
-            if self._unreachable.get(host, 0) > now:
-                # Recently seen as IP-blocked; don't grind the ladder on a dead
-                # address. Fail fast so the browser shows its error promptly.
-                raise ConnectionError(f"{host} appears blocked at the IP level")
-            pick = self.learned.get(host)
-            if (pick is None and self._select_failed.get(host, 0) < now):
-                pick = await self._select_strategy(host, port)
-            if pick:
-                # Use only the verified strategy - never fall back down the
-                # ladder to one we know reaches the interceptor, or that
-                # connection would get a forged cert. One retry absorbs a
-                # transient blip; a real failure invalidates the pick below.
-                verified_pick = pick
-                order = [pick, pick]
-            elif self._unreachable.get(host, 0) > now:
-                raise ConnectionError(f"{host} appears blocked at the IP level")
-            else:
-                order = self._ladder_for(host)   # reachable but unverified: passive
-        else:
-            order = self._ladder_for(host)
+            return await self._attempt(host, port, ips, first, ["http"],
+                                       tls_expected=False, http=True)
+        if not (tls_expected and self._is_auto()):
+            return await self._attempt(host, port, ips, first,
+                                       self._ladder_for(host), tls_expected)
 
+        # A "did I get a handshake back?" success check is fooled by an
+        # intercepting middlebox, which answers with its own valid handshake
+        # and a forged certificate. So in auto mode the strategy is chosen by
+        # cert validation instead (see _run_selection) and cached.
+        pick = await self._verified_pick(host, port)
+        if pick is None:
+            # Reachable, but no strategy produced a trusted certificate: relay
+            # passively and let the client's own TLS decide. Nothing is cached
+            # from this, since "got a handshake back" proves nothing here.
+            return await self._attempt(host, port, ips, first,
+                                       self._ladder_for(host), True,
+                                       remember=False)
+        try:
+            # Use only the verified strategy - never fall back down the ladder
+            # to one known to reach the interceptor, or this connection would
+            # be handed a forged cert. It gets a shorter wait than usual: if a
+            # strategy that worked a moment ago has gone silent, it is far more
+            # likely to be newly dropped than slow, and re-selecting is cheap.
+            return await self._attempt(
+                host, port, ips, first, [pick], True,
+                reply_timeout=min(self.ctx.handshake_timeout, 3.0))
+        except (OSError, asyncio.TimeoutError) as exc:
+            # The verified strategy stopped working: the network changed, or
+            # the middlebox changed its mind. Re-select right now, while the
+            # client is still waiting, instead of failing this connection and
+            # making the app retry.
+            self._forget(host)
+            self.log.debug(f"{host}: verified pick {pick} failed ({exc!r}); "
+                           "re-selecting")
+            pick = await self._verified_pick(host, port)
+            if pick is None:
+                raise
+            return await self._attempt(host, port, ips, first, [pick], True)
+
+    async def _attempt(self, host, port, ips, first, order, tls_expected,
+                       http=False, remember=True, reply_timeout=None):
+        """Try each strategy in `order` until the server answers properly."""
+        if reply_timeout is None:
+            reply_timeout = self.ctx.handshake_timeout
         pinned = None
         last = None
         for name in order:
@@ -309,8 +350,7 @@ class Proxy:
                     self._record(host, port, name)
                     return up, b"", name
 
-                reply = await asyncio.wait_for(up.recv(),
-                                               self.ctx.handshake_timeout)
+                reply = await asyncio.wait_for(up.recv(), reply_timeout)
                 if not reply:
                     raise ConnectionResetError("server closed after ClientHello")
                 if reply[0] != REC_HANDSHAKE:
@@ -321,7 +361,8 @@ class Proxy:
                     raise ConnectionResetError(
                         f"non-handshake reply to ClientHello (0x{reply[0]:02x})"
                     )
-                self._remember(host, name)
+                if remember:
+                    self._remember(host, name)
                 self._record(host, port, name)
                 return up, reply, name
             except (OSError, asyncio.TimeoutError) as exc:
@@ -330,15 +371,6 @@ class Proxy:
                 self.log.debug(f"{host}: {name} failed ({exc!r})")
                 continue
 
-        if verified_pick is not None:
-            # The strategy we verified stopped working. Drop it so the next
-            # connection re-probes rather than repeating a dead choice - the
-            # network may have changed (moved AP, new firewall policy).
-            self.learned.pop(host, None)
-            self._select_failed.pop(host, None)
-            self._dirty = True
-            self.log.debug(f"{host}: verified pick {verified_pick} failed; "
-                           "will re-probe next time")
         raise last or ConnectionError(f"all strategies failed for {host}")
 
     def _record(self, host, port, name):
@@ -352,35 +384,145 @@ class Proxy:
         """True when more than one strategy is on the ladder (i.e. not pinned)."""
         return len(self.ctx.ladder) > 1
 
-    async def _select_strategy(self, host, port):
-        """Pick a strategy whose cert validates, deduping concurrent callers."""
+    async def _verified_pick(self, host, port):
+        """The strategy known to reach the real `host`, or None for none.
+
+        Raises ConnectionError when the host is blocked on every strategy, so
+        the client is told promptly rather than after grinding the ladder.
+        """
+        now = time.time()
+        if self._unreachable.get(host, 0) > now:
+            raise ConnectionError(f"{host} is blocked on every strategy")
+
+        pick = self.learned.get(host)
+        if pick not in self.ctx.ladder:
+            pick = None
+        if pick is not None:
+            seen = self._verified_at.get(host)
+            if seen is None:
+                # Learned on an earlier run or another network. Check it with
+                # one probe before trusting it; re-select if it has gone stale.
+                pick = await self._select_strategy(host, port, cached=pick)
+            elif time.monotonic() - seen > self.ctx.reverify_after:
+                # Verified a while ago on this network: keep using it, and
+                # re-check in the background so drift is caught without making
+                # this connection wait.
+                self._selection_task(host, port, cached=pick)
+        elif self._select_failed.get(host, 0) < now:
+            pick = await self._select_strategy(host, port)
+
+        if pick is None and self._unreachable.get(host, 0) > time.time():
+            raise ConnectionError(f"{host} is blocked on every strategy")
+        return pick
+
+    def _selection_task(self, host, port, cached=None):
+        """The in-flight selection for `host`, started if there is none."""
         task = self._selecting.get(host)
         if task is None:
-            task = asyncio.ensure_future(self._run_selection(host, port))
+            task = asyncio.ensure_future(
+                self._run_selection(host, port, cached))
             self._selecting[host] = task
-            task.add_done_callback(lambda _t: self._selecting.pop(host, None))
-        return await task
 
-    async def _run_selection(self, host, port):
-        # Probe every strategy at once rather than in sequence. Different
+            def _done(t, host=host):
+                self._selecting.pop(host, None)
+                if not t.cancelled() and t.exception() is not None:
+                    self.log.debug(f"selection for {host} failed: "
+                                   f"{t.exception()!r}")
+            task.add_done_callback(_done)
+        return task
+
+    async def _select_strategy(self, host, port, cached=None):
+        """Pick a strategy whose cert validates, deduping concurrent callers."""
+        # Shielded: one client giving up must not cancel the probe that every
+        # other connection to this host is waiting on.
+        return await asyncio.shield(self._selection_task(host, port, cached))
+
+    async def _run_selection(self, host, port, cached=None):
+        if cached is not None:
+            if await self._probe_strategy(host, port, cached) == "valid":
+                self._verified_at[host] = time.monotonic()
+                return cached
+            self._forget(host)
+            self.log.info(f"{host}: {cached} no longer reaches the real "
+                          "server; re-selecting")
+
+        # Probe every strategy rather than stopping at the first failures:
         # strategies genuinely differ on a given network - some blocked, some
-        # not - so we must try them all, but doing so concurrently bounds the
-        # whole thing by a single timeout instead of one per strategy. Among the
-        # strategies whose cert validates, the earliest in the ladder wins, so
-        # the choice stays deterministic and follows the ladder's preference.
+        # not - so a later one can work where the earlier ones do not. They run
+        # concurrently, each starting a beat after the one before it, so a
+        # network that needs no evasion settles on the first rung having barely
+        # started the rest, while a hostile one still gets through the whole
+        # ladder in well under a second.
         ladder = list(self.ctx.ladder)
-        results = await asyncio.gather(
-            *[self._probe_strategy(host, port, name) for name in ladder])
+        loop = asyncio.get_running_loop()
 
-        for name, status in zip(ladder, results):
-            if status == "valid":
-                self._remember(host, name)
-                self.save_state()
-                if self.ctx.verbose:
-                    self.log.info(f"auto-selected {name} for {host} (cert verified)")
-                return name
+        async def staggered(index, name):
+            if index:
+                await asyncio.sleep(index * self.ctx.probe_stagger)
+            return await self._probe_strategy(host, port, name)
 
-        if all(s in ("blocked", "unreachable") for s in results):
+        tasks = {asyncio.ensure_future(staggered(i, n)): n
+                 for i, n in enumerate(ladder)}
+        pending = set(tasks)
+        results = {}
+        winner = None
+        deadline = None
+        try:
+            while pending:
+                timeout = (None if deadline is None
+                           else max(0.0, deadline - loop.time()))
+                done, pending = await asyncio.wait(
+                    pending, timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    try:
+                        results[tasks[task]] = task.result()
+                    except Exception:                         # noqa: BLE001
+                        results[tasks[task]] = "blocked"
+                valid = [n for n in ladder if results.get(n) == "valid"]
+                if not valid:
+                    continue
+                winner = valid[0]
+                # Among strategies that validate, the earliest on the ladder
+                # wins. Rungs above the current winner that have not answered
+                # yet get a short grace period - they started first, so if they
+                # are still silent they are almost certainly being dropped, and
+                # waiting out their timeout would stall the client for nothing.
+                ahead = set(ladder[:ladder.index(winner)])
+                if not any(tasks[t] in ahead for t in pending):
+                    break
+                if deadline is None:
+                    deadline = loop.time() + self.ctx.probe_grace
+                elif loop.time() >= deadline:
+                    break
+        finally:
+            # Rungs above the winner that ran out of grace keep going in the
+            # background (see _upgrade); everything else is abandoned.
+            ahead = (set(ladder[:ladder.index(winner)])
+                     if winner is not None else set())
+            late = {t: tasks[t] for t in pending if tasks[t] in ahead}
+            stop = [t for t in pending if t not in late]
+            for task in stop:
+                task.cancel()
+            if stop:
+                await asyncio.gather(*stop, return_exceptions=True)
+
+        if winner is not None:
+            self._remember(host, winner)
+            self._verified_at[host] = time.monotonic()
+            self._select_failed.pop(host, None)
+            self._unreachable.pop(host, None)
+            self.save_state()
+            if self.ctx.verbose:
+                self.log.info(f"auto-selected {winner} for {host} (cert verified)")
+            if late:
+                job = asyncio.ensure_future(
+                    self._upgrade(host, winner, late, ladder))
+                self._background.add(job)
+                job.add_done_callback(self._background.discard)
+            return winner
+
+        if all(s in ("blocked", "unreachable") for s in results.values()):
             # No strategy even got a certificate back - the handshake is being
             # killed or the address dropped on all of them. Nothing local beats
             # this; a VPN is needed. Fail fast next time rather than re-probing.
@@ -395,6 +537,29 @@ class Proxy:
         self.log.debug(f"no strategy produced a trusted cert for {host}; "
                        "falling back to passive relay")
         return None
+
+    async def _upgrade(self, host, winner, late, ladder):
+        """Let slower, higher-ranked probes finish, and prefer one if it works.
+
+        The client was not kept waiting for these, so it is already using
+        `winner`. But a preferred strategy that merely answered a moment late
+        (a lost SYN, a busy link) is still the better long-term choice, and
+        this is how the cached pick converges on it.
+        """
+        statuses = await asyncio.gather(*late, return_exceptions=True)
+        valid = {name for name, status in zip(late.values(), statuses)
+                 if status == "valid"}
+        for name in ladder:
+            if name in valid:
+                # Only if nothing has replaced or dropped the pick meanwhile.
+                if self.learned.get(host) == winner:
+                    self._remember(host, name)
+                    self._verified_at[host] = time.monotonic()
+                    self.save_state()
+                    if self.ctx.verbose:
+                        self.log.info(f"upgraded {host} from {winner} to "
+                                      f"{name} (cert verified)")
+                return
 
     async def _probe_strategy(self, host, port, strategy) -> str:
         """Probe one strategy. Returns one of:
@@ -460,6 +625,24 @@ class Proxy:
             self.learned[host] = name
             self._dirty = True
 
+    def _forget(self, host):
+        """Drop everything cached about how to reach `host`."""
+        if self.learned.pop(host, None) is not None:
+            self._dirty = True
+        self._verified_at.pop(host, None)
+        self._select_failed.pop(host, None)
+
+    def forget_verification(self):
+        """Treat every cached strategy as unverified again.
+
+        Called when the network changes: what reached the real server on the
+        last network may reach an interceptor on this one, so each host gets
+        re-checked (one probe) the next time it is used.
+        """
+        self._verified_at.clear()
+        self._select_failed.clear()
+        self._unreachable.clear()
+
     def save_state(self):
         if self.ctx.learn and self._dirty:
             _save_state(self.learned)
@@ -467,25 +650,77 @@ class Proxy:
 
     # --- relaying ----------------------------------------------------------
 
-    async def _relay(self, reader, writer, up):
+    async def _relay(self, reader, writer, up, host=None, strategy=None,
+                     received=0):
+        """Pump bytes both ways until either side is done.
+
+        `strategy` is the TLS strategy this connection was opened with (None
+        for plaintext), and `received` how much of the server's reply has
+        already been read - both only feed the handshake bookkeeping below.
+        """
         self.stats["active"] += 1
+        flow = {"up": 0, "down": received}
+        started = time.monotonic()
         try:
             await asyncio.gather(
-                self._client_to_server(reader, up),
-                self._server_to_client(up, writer),
+                self._client_to_server(reader, up, flow, host, strategy),
+                self._server_to_client(up, writer, flow),
                 return_exceptions=True,
             )
         finally:
             self.stats["active"] -= 1
             up.close()
+        if strategy is not None:
+            self._note_handshake_outcome(host, flow,
+                                         time.monotonic() - started)
 
-    async def _client_to_server(self, reader, up):
+    def _note_handshake_outcome(self, host, flow, elapsed):
+        """Spot a client that rejected the certificate it was handed.
+
+        The engine relays TLS without decrypting it, so it cannot see a forged
+        certificate go past. It can see the consequence, though: the client
+        receives the server's handshake flight and hangs up having sent at most
+        an alert. When that happens on a strategy we believed verified, the
+        strategy has probably gone stale, so it is re-checked before the next
+        connection uses it - which is what makes an app's retry succeed.
+        """
+        seen = self._verified_at.get(host)
+        if seen is None:
+            return
+        if (flow["down"] and flow["up"] <= ABORT_BYTES and elapsed < 8.0
+                and time.monotonic() - seen > 20.0):
+            del self._verified_at[host]
+            self.log.debug(f"{host}: client abandoned the handshake; "
+                           "will re-verify the strategy")
+
+    async def _client_to_server(self, reader, up, flow, host=None,
+                                strategy=None):
+        # A server may answer the first ClientHello with a HelloRetryRequest,
+        # and the client then sends a second ClientHello - hostname and all.
+        # Left alone it would cross the wire in one clean record, handing a DPI
+        # box that follows the handshake exactly what the first one hid. So
+        # the client's opening few chunks are watched for it, and it gets the
+        # same treatment.
+        resend = desync.TLS_STRATEGIES.get(strategy) if host else None
+        watched = 0
         try:
             while True:
                 data = await self._with_idle(reader.read(65536))
                 if not data:
                     break
                 self.stats["bytes_up"] += len(data)
+                flow["up"] += len(data)
+                if resend is not None:
+                    watched += 1
+                    offset = tls.find_client_hello(data, host)
+                    if offset is not None:
+                        if offset:
+                            await up.send(data[:offset])
+                        await resend(up, data[offset:], self.ctx)
+                        resend = None
+                        continue
+                    if watched >= HELLO_WATCH_CHUNKS:
+                        resend = None
                 await up.send(data)
         finally:
             try:
@@ -493,13 +728,14 @@ class Proxy:
             except OSError:
                 pass
 
-    async def _server_to_client(self, up, writer):
+    async def _server_to_client(self, up, writer, flow):
         try:
             while True:
                 data = await self._with_idle(up.recv())
                 if not data:
                     break
                 self.stats["bytes_down"] += len(data)
+                flow["down"] += len(data)
                 writer.write(data)
                 await writer.drain()
         finally:
@@ -528,6 +764,38 @@ async def _read_until(reader, delim, limit):
             break
         buf += chunk
     return buf
+
+
+async def _complete_record(reader, first, timeout=2.0, limit=65536):
+    """Read on until the whole first TLS record - the ClientHello - is in hand.
+
+    A ClientHello with post-quantum key shares runs to a couple of kilobytes
+    and can arrive in more than one read, and nothing stops the first read
+    from delivering only a byte or two of it. The strategies need all of it:
+    too little and it is not even recognisable as TLS, and the hostname may
+    sit in the part that has not arrived yet. Anything that does not start
+    like a TLS handshake record is returned untouched.
+    """
+    deadline = time.monotonic() + timeout
+
+    def wanted():
+        if first[:1] != bytes([tls.REC_HANDSHAKE]) or len(first) >= limit:
+            return False
+        return len(first) < 6 or (tls.is_client_hello(first)
+                                  and tls.record_missing(first) > 0)
+
+    while wanted():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            more = await asyncio.wait_for(reader.read(65536), remaining)
+        except asyncio.TimeoutError:
+            break
+        if not more:
+            break
+        first += more
+    return first
 
 
 def _http_host(data: bytes):

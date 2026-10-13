@@ -14,6 +14,16 @@ enum Paths {
         FileManager.default.fileExists(atPath: engineDir + "/macdpi/__main__.py")
     }
 
+    /// Interpreter options for every engine launch. Python caches compiled
+    /// bytecode beside its sources by default, which here would mean writing
+    /// into the app bundle - and a bundle that has been written to no longer
+    /// matches its code signature, so a copy of it handed to another Mac is
+    /// rejected as damaged. Keeping the cache with the rest of the state leaves
+    /// the bundle exactly as it was signed.
+    static var pythonOptions: [String] {
+        ["-X", "pycache_prefix=" + stateDir + "/pycache"]
+    }
+
     private static var cachedPython: String?
 
     /// The Python runtime bundled inside the app for this Mac's architecture.

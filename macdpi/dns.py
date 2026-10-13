@@ -6,18 +6,25 @@ ever needed to bootstrap it.
 """
 
 import asyncio
-import os
 import random
 import ssl
 import struct
 import time
 
+from .desync import DEFAULT_LADDER, TLS_STRATEGIES
 from .netio import Upstream
 from .tlsclient import TLSStream
 
 TYPE_A = 1
 TYPE_AAAA = 28
 TYPE_CNAME = 5
+
+# Lookups run over a few keep-alive connections at once, so a page that needs
+# thirty names does not queue them all behind a single one.
+DOH_CONNECTIONS = 4
+# How long a provider that failed is set aside before it is tried again.
+PROVIDER_COOLDOWN = 120
+MAX_RESPONSE = 65536
 
 
 def encode_query(name: str, qtype: int) -> bytes:
@@ -64,6 +71,35 @@ def _fmt_ip(rtype: int, rdata: bytes):
     return None
 
 
+class _ProviderError(Exception):
+    """The resolver answered, but not with a usable DNS response."""
+
+
+class _Conn:
+    """One keep-alive HTTPS connection to a DoH provider."""
+
+    __slots__ = ("stream", "provider", "strategy", "buf", "keep", "fresh")
+
+    def __init__(self, stream, provider, strategy):
+        self.stream = stream
+        self.provider = provider
+        self.strategy = strategy
+        self.buf = bytearray()
+        self.keep = True
+        # True until a query has succeeded on it. A failure on a fresh
+        # connection is the provider's fault; on a reused one it is usually
+        # just a keep-alive that the server timed out.
+        self.fresh = True
+
+    def close(self):
+        self.stream.close()
+
+
+# Anything that means "this connection is no good, try another".
+_RETRYABLE = (_ProviderError, ConnectionError, OSError, ValueError,
+              ssl.SSLError, asyncio.TimeoutError)
+
+
 class Resolver:
     """Caching DoH resolver with a system-DNS fallback."""
 
@@ -71,24 +107,38 @@ class Resolver:
         self.ctx = ctx
         self.log = log
         self._cache = {}
-        self._lock = asyncio.Lock()
-        self._stream = None
+        # One lookup per name at a time: a browser opening six connections to
+        # a host must not turn into six identical queries.
+        self._pending = {}
+        self._idle = []
+        # Created on first use, so they bind to the loop that is running.
+        self._slots = None
+        self._discovery = None
         self._doh_broken_until = 0.0
-        # The (provider, strategy) that last worked, tried first next time so we
-        # do not re-probe every combination once one is known good.
+        # The (provider, strategy) that last worked, tried first next time so
+        # every combination is not re-probed once one is known good.
         self._doh_pin = None
-        # The provider (ip, host, path) the current stream is talking to, so the
-        # request carries the right Host header and path after a fallback.
-        self._active_provider = None
+        # Providers that failed recently, with the time they may be retried.
+        self._cooldown = {}
 
     def reset(self):
         """Forget cached answers and re-arm DoH after a network change."""
         self._cache.clear()
         self._doh_broken_until = 0.0
         self._doh_pin = None
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
+        self._cooldown.clear()
+        for conn in self._idle:
+            conn.close()
+        self._idle.clear()
+
+    @property
+    def active_host(self):
+        """The DoH provider actually answering right now, if one is known."""
+        if not self.ctx.doh:
+            return None
+        if self._doh_pin is not None:
+            return self._doh_pin[0][1]
+        return self.ctx.doh_host
 
     async def resolve(self, host: str, want_v6: bool = False):
         """Return a list of IP strings for `host`, best candidate first."""
@@ -99,6 +149,21 @@ class Resolver:
         if hit and hit[1] > time.time():
             return hit[0]
 
+        task = self._pending.get(host)
+        if task is None:
+            task = asyncio.ensure_future(self._lookup(host, want_v6))
+            self._pending[host] = task
+
+            def _done(t, host=host):
+                self._pending.pop(host, None)
+                if not t.cancelled():
+                    t.exception()
+            task.add_done_callback(_done)
+        # Shielded: one caller giving up must not cancel the lookup the others
+        # are waiting on.
+        return await asyncio.shield(task)
+
+    async def _lookup(self, host: str, want_v6: bool):
         ips = []
         if self.ctx.doh and time.time() >= self._doh_broken_until:
             try:
@@ -106,7 +171,6 @@ class Resolver:
             except Exception as exc:                       # noqa: BLE001
                 self.log.warn(f"DoH lookup failed for {host}: {exc}")
                 self._doh_broken_until = time.time() + 30
-                await self._drop_stream()
 
         if not ips:
             ips = await self._resolve_system(host)
@@ -126,86 +190,158 @@ class Resolver:
         v6 = [i[4][0] for i in infos if i[0].name == "AF_INET6"]
         return v4 + v6
 
-    async def _drop_stream(self):
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
-
-    def _doh_attempts(self):
-        """(provider, strategy) pairs to try, the last known-good one first.
-
-        Trying several providers covers a network that blocks one DoH endpoint;
-        trying several strategies covers one that DPI-filters the DoH handshake
-        itself. The TLS handshake verifies the resolver's certificate, so a
-        combination that only reaches an interceptor fails and is skipped.
-        """
-        providers = self.ctx.doh_providers or [
-            (self.ctx.doh_ip, self.ctx.doh_host, self.ctx.doh_path)]
-        strategies = [self.ctx.doh_strategy, "tlsfrag", "tlsfrag+oob",
-                      "multisplit", "direct"]
-        seen = set()
-        pairs = []
-        for combo in ([self._doh_pin] if self._doh_pin else []):
-            pairs.append(combo); seen.add(combo)
-        for prov in providers:
-            for strat in strategies:
-                combo = (prov, strat)
-                if combo not in seen:
-                    seen.add(combo); pairs.append(combo)
-        return pairs
-
-    async def _get_stream(self):
-        if self._stream is not None:
-            return self._stream
-        from .desync import TLS_STRATEGIES
-        last = None
-        for provider, strat in self._doh_attempts():
-            ip, dhost, _path = provider
-            if not _looks_like_ip(ip):
-                candidates = await self._resolve_system(ip)
-                if not candidates:
-                    continue
-                ip = candidates[0]
-            up = None
-            try:
-                up = await Upstream.connect(
-                    ip, 443, self.ctx.connect_timeout,
-                    reserve_source_port=self.ctx.transparent)
-                stream = TLSStream(up, dhost, TLS_STRATEGIES.get(strat), self.ctx)
-                await asyncio.wait_for(stream.handshake(),
-                                       self.ctx.handshake_timeout)
-                if self._doh_pin != (provider, strat):
-                    self._doh_pin = (provider, strat)
-                    self.log.info(f"DoH via {dhost} using {strat}")
-                self._active_provider = provider
-                self._stream = stream
-                return stream
-            except (ssl.SSLError, asyncio.TimeoutError, OSError) as exc:
-                last = exc
-                if up is not None:
-                    up.close()
-        raise last or ConnectionError("no DoH provider reachable")
+    # --- DoH ---------------------------------------------------------------
 
     async def _resolve_doh(self, host: str, want_v6: bool):
-        async with self._lock:
-            for attempt in (1, 2):
+        if self._slots is None:
+            self._slots = asyncio.Semaphore(DOH_CONNECTIONS)
+        async with self._slots:
+            last = None
+            for _attempt in range(3):
+                conn = await self._checkout()
                 try:
-                    v4 = await self._doh_query(host, TYPE_A)
-                    v6 = await self._doh_query(host, TYPE_AAAA) if want_v6 else []
-                    return v4 + v6
-                except (ConnectionError, OSError, ValueError):
-                    await self._drop_stream()
-                    if attempt == 2:
-                        raise
-            return []
+                    ips = await self._query(conn, host, TYPE_A)
+                    if want_v6:
+                        ips += await self._query(conn, host, TYPE_AAAA)
+                except _RETRYABLE as exc:
+                    last = exc
+                    conn.close()
+                    if conn.fresh:
+                        # A brand-new connection that cannot answer: the
+                        # provider itself is the problem. Move on to another.
+                        self._demote(conn.provider, exc)
+                    continue
+                self._checkin(conn)
+                return ips
+            raise last or ConnectionError("DoH query failed")
 
-    async def _doh_query(self, host: str, qtype: int):
+    async def _checkout(self):
+        if self._idle:
+            return self._idle.pop()
+        return await self._connect()
+
+    def _checkin(self, conn):
+        if conn.keep and len(self._idle) < DOH_CONNECTIONS:
+            self._idle.append(conn)
+        else:
+            conn.close()
+
+    def _demote(self, provider, reason):
+        if self._doh_pin is not None and self._doh_pin[0] == provider:
+            self._doh_pin = None
+        self._cooldown[provider] = time.time() + PROVIDER_COOLDOWN
+        self.log.debug(f"DoH provider {provider[1]} ({provider[0]}) set aside: "
+                       f"{reason}")
+
+    def _providers(self):
+        providers = self.ctx.doh_providers or [
+            (self.ctx.doh_ip, self.ctx.doh_host, self.ctx.doh_path)]
+        now = time.time()
+        ready = [p for p in providers if self._cooldown.get(p, 0) <= now]
+        # If everything is cooling down, try them all again rather than
+        # leaving the user on the network's own DNS.
+        return ready or list(providers)
+
+    def _strategies(self):
+        first = self.ctx.doh_strategy
+        return [first] + [n for n in DEFAULT_LADDER if n != first]
+
+    async def _connect(self):
+        """Open a connection to a working provider, finding one if need be."""
+        conn = await self._dial_pinned()
+        if conn is not None:
+            return conn
+        if self._discovery is None:
+            self._discovery = asyncio.Lock()
+        async with self._discovery:
+            # Whoever held the lock before us may already have found one.
+            conn = await self._dial_pinned()
+            if conn is not None:
+                return conn
+            return await self._discover()
+
+    async def _dial_pinned(self):
+        pin = self._doh_pin
+        if pin is None:
+            return None
+        try:
+            return await self._dial(*pin)
+        except _RETRYABLE:
+            if self._doh_pin == pin:
+                self._doh_pin = None
+            return None
+
+    async def _discover(self):
+        """Find a (provider, strategy) pair that reaches a genuine resolver.
+
+        Several providers cover a network that blocks one DoH endpoint;
+        several strategies cover one that DPI-filters the DoH handshake itself.
+        The handshake verifies the resolver's certificate and name, so a
+        combination that only reaches an interceptor fails and is passed over.
+        """
+        deadline = time.monotonic() + self.ctx.doh_budget
+        for provider in self._providers():
+            if time.monotonic() > deadline:
+                break
+            conn = await self._race(provider)
+            if conn is not None:
+                self._doh_pin = (provider, conn.strategy)
+                self.log.info(f"DoH via {provider[1]} ({provider[0]}) "
+                              f"using {conn.strategy}")
+                return conn
+            self._cooldown[provider] = time.time() + PROVIDER_COOLDOWN
+        raise ConnectionError("no DoH provider reachable")
+
+    async def _race(self, provider):
+        """Try every strategy against one provider; the first through wins."""
+        async def attempt(index, name):
+            if index:
+                await asyncio.sleep(index * self.ctx.probe_stagger)
+            return await self._dial(provider, name)
+
+        pending = {asyncio.ensure_future(attempt(i, n))
+                   for i, n in enumerate(self._strategies())}
+        winner = None
+        try:
+            while pending and winner is None:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    if task.cancelled() or task.exception() is not None:
+                        continue
+                    if winner is None:
+                        winner = task.result()
+                    else:
+                        task.result().close()
+        finally:
+            for task in pending:
+                task.cancel()
+            for late in await asyncio.gather(*pending, return_exceptions=True):
+                if isinstance(late, _Conn):
+                    late.close()
+        return winner
+
+    async def _dial(self, provider, strategy):
+        ip, dhost, _path = provider
+        if not _looks_like_ip(ip):
+            candidates = await self._resolve_system(ip)
+            if not candidates:
+                raise ConnectionError(f"cannot resolve {ip}")
+            ip = candidates[0]
+        up = await Upstream.connect(
+            ip, 443, self.ctx.probe_timeout,
+            reserve_source_port=self.ctx.transparent)
+        try:
+            stream = TLSStream(up, dhost, TLS_STRATEGIES.get(strategy), self.ctx)
+            await asyncio.wait_for(stream.handshake(), self.ctx.probe_timeout)
+        except BaseException:
+            up.close()
+            raise
+        return _Conn(stream, provider, strategy)
+
+    async def _query(self, conn, host: str, qtype: int):
         body = encode_query(host, qtype)
-        # The stream is opened before the request so the Host/path match
-        # whichever provider actually answered (it may be a fallback).
-        stream = await self._get_stream()
-        _ip, dhost, dpath = self._active_provider or (
-            self.ctx.doh_ip, self.ctx.doh_host, self.ctx.doh_path)
+        _ip, dhost, dpath = conn.provider
         req = (
             f"POST {dpath} HTTP/1.1\r\n"
             f"Host: {dhost}\r\n"
@@ -215,43 +351,100 @@ class Resolver:
             "Connection: keep-alive\r\n\r\n"
         ).encode() + body
 
-        await stream.write(req)
-
-        raw = b""
-        while b"\r\n\r\n" not in raw:
-            chunk = await asyncio.wait_for(stream.read(), self.ctx.dns_timeout)
-            if not chunk:
-                raise ConnectionError("DoH connection closed")
-            raw += chunk
-
-        head, _, rest = raw.partition(b"\r\n\r\n")
-        length = _content_length(head)
-        if length is None:
-            raise ValueError("DoH response without Content-Length")
-        while len(rest) < length:
-            chunk = await asyncio.wait_for(stream.read(), self.ctx.dns_timeout)
-            if not chunk:
-                raise ConnectionError("DoH response truncated")
-            rest += chunk
+        await conn.stream.write(req)
+        status, payload, conn.keep = await asyncio.wait_for(
+            _read_response(conn), self.ctx.dns_timeout)
+        if status != 200:
+            raise _ProviderError(f"HTTP {status} from {dhost}")
 
         ips = []
-        for rtype, rdata, _ttl in decode_answers(rest[:length]):
-            if rtype == TYPE_CNAME:
-                continue
-            ip = _fmt_ip(rtype, rdata)
-            if ip:
-                ips.append(ip)
+        try:
+            for rtype, rdata, _ttl in decode_answers(payload):
+                if rtype == TYPE_CNAME:
+                    continue
+                ip = _fmt_ip(rtype, rdata)
+                if ip:
+                    ips.append(ip)
+        except (IndexError, struct.error) as exc:
+            raise _ProviderError(f"malformed DNS answer from {dhost}") from exc
+        conn.fresh = False
         return ips
 
 
-def _content_length(head: bytes):
-    for line in head.split(b"\r\n"):
-        if line.lower().startswith(b"content-length:"):
-            try:
-                return int(line.split(b":", 1)[1].strip())
-            except ValueError:
-                return None
-    return None
+# --- minimal HTTP/1.1 response reading -------------------------------------
+
+
+async def _fill(conn):
+    chunk = await conn.stream.read()
+    if not chunk:
+        raise ConnectionError("DoH connection closed")
+    conn.buf += chunk
+    if len(conn.buf) > MAX_RESPONSE:
+        raise ValueError("DoH response too large")
+
+
+async def _line(conn) -> bytes:
+    while b"\r\n" not in conn.buf:
+        await _fill(conn)
+    end = conn.buf.index(b"\r\n")
+    line = bytes(conn.buf[:end])
+    del conn.buf[:end + 2]
+    return line
+
+
+async def _exactly(conn, n: int) -> bytes:
+    if n > MAX_RESPONSE:
+        raise ValueError("DoH response too large")
+    while len(conn.buf) < n:
+        await _fill(conn)
+    data = bytes(conn.buf[:n])
+    del conn.buf[:n]
+    return data
+
+
+async def _read_response(conn):
+    """Read one HTTP response. Returns (status, body, connection_reusable)."""
+    try:
+        status = int((await _line(conn)).split()[1])
+    except (IndexError, ValueError) as exc:
+        raise ValueError("malformed DoH response") from exc
+
+    headers = {}
+    while True:
+        line = await _line(conn)
+        if not line:
+            break
+        key, _, value = line.partition(b":")
+        headers[key.strip().lower()] = value.strip()
+
+    keep = headers.get(b"connection", b"").lower() != b"close"
+    if b"chunked" in headers.get(b"transfer-encoding", b"").lower():
+        body = bytearray()
+        while True:
+            size = int((await _line(conn)).split(b";")[0] or b"0", 16)
+            if size == 0:
+                while await _line(conn):        # trailers, up to a blank line
+                    pass
+                break
+            body += await _exactly(conn, size)
+            await _exactly(conn, 2)             # the CRLF after each chunk
+            if len(body) > MAX_RESPONSE:
+                raise ValueError("DoH response too large")
+        return status, bytes(body), keep
+    if b"content-length" in headers:
+        return status, await _exactly(conn, int(headers[b"content-length"])), keep
+    # No framing at all: the body, if any, runs to the end of the connection,
+    # which therefore cannot be used again. Error replies commonly look like
+    # this, and for those the status is all that matters.
+    if status == 200:
+        try:
+            while True:
+                await _fill(conn)
+        except ConnectionError:
+            pass
+    body = bytes(conn.buf)
+    conn.buf.clear()
+    return status, body, False
 
 
 def _looks_like_ip(host: str) -> bool:

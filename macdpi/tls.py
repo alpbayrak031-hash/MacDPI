@@ -62,21 +62,82 @@ def sni_host(data: bytes):
         return None
 
 
-def fragment_record(data: bytes, pos: int) -> bytes:
-    """Re-encode the first TLS record as two records split at `pos`.
+def find_client_hello(data: bytes, host: str):
+    """Offset of a ClientHello record for `host` within `data`, or None.
 
-    A handshake message is allowed to span several records, so servers accept
-    this happily while a DPI box that only parses the first record never sees a
-    complete ClientHello.
+    Walks `data` record by record, so it finds a ClientHello that follows
+    another record (a second ClientHello is commonly preceded by a dummy
+    change_cipher_spec). The hostname must match: once a session is encrypted
+    its records are arbitrary bytes, and requiring a well-formed ClientHello
+    naming the very host this connection is for rules out a chance match.
     """
-    if len(data) < 5 or data[0] != REC_HANDSHAKE:
-        return data
+    want = (host or "").lower().rstrip(".")
+    off = 0
+    while off + 6 <= len(data):
+        if data[off] not in (0x14, 0x15, REC_HANDSHAKE, 0x17):
+            return None
+        if data[off] == REC_HANDSHAKE and data[off + 5] == HS_CLIENT_HELLO:
+            name = sni_host(data[off:])
+            if name and name.lower().rstrip(".") == want:
+                return off
+            return None
+        off += 5 + int.from_bytes(data[off + 3:off + 5], "big")
+    return None
+
+
+def record_missing(data: bytes) -> int:
+    """How many bytes of the first TLS record have not arrived yet (0 if whole)."""
+    if len(data) < 5:
+        return 0
+    return max(0, 5 + int.from_bytes(data[3:5], "big") - len(data))
+
+
+def fragment_records(data: bytes, cuts):
+    """Re-encode the first TLS record as several records, cut at `cuts`.
+
+    `cuts` are offsets into the record body. A handshake message is allowed to
+    span several records, so servers accept this happily, while a DPI box has
+    to reassemble handshake messages across records to recover the hostname.
+    The record header is not covered by the handshake transcript, which is why
+    re-framing is invisible to both ends of the TLS session.
+
+    Returns a list of byte chunks, one per record; anything that followed the
+    first record rides along on the last chunk. The last record is declared at
+    its true length even if the tail of it has not been read from the client
+    yet, so those bytes complete it when they are relayed afterwards.
+    """
+    if len(data) < 6 or data[0] != REC_HANDSHAKE:
+        return [data]
     rec_len = int.from_bytes(data[3:5], "big")
     body = data[5:5 + rec_len]
     rest = data[5 + rec_len:]
-    if not 0 < pos < len(body):
-        return data
+    cuts = sorted({c for c in cuts if 0 < c < len(body)})
+    if not cuts:
+        return [data]
     hdr = data[0:3]
-    first = hdr + len(body[:pos]).to_bytes(2, "big") + body[:pos]
-    second = hdr + len(body[pos:]).to_bytes(2, "big") + body[pos:]
-    return first + second + rest
+    out = []
+    prev = 0
+    for cut in cuts:
+        out.append(hdr + (cut - prev).to_bytes(2, "big") + body[prev:cut])
+        prev = cut
+    out.append(hdr + (rec_len - prev).to_bytes(2, "big") + body[prev:] + rest)
+    return out
+
+
+def fragment_record(data: bytes, pos: int) -> bytes:
+    """Re-encode the first TLS record as two records split at `pos`."""
+    return b"".join(fragment_records(data, [pos]))
+
+
+def with_record_version(data: bytes, version: bytes) -> bytes:
+    """Rewrite the record-layer version of the first TLS record.
+
+    This is the `legacy_record_version` field. RFC 8446 says it "MUST be
+    ignored for all purposes" and it is not part of the handshake transcript,
+    so a server negotiates exactly as before - the real version lives inside
+    the ClientHello. A DPI box that recognises TLS by the literal bytes
+    16 03 01..03 no longer sees a TLS record at all.
+    """
+    if len(data) < 5 or data[0] != REC_HANDSHAKE or len(version) != 2:
+        return data
+    return data[0:1] + version + data[3:]

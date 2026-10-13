@@ -24,7 +24,7 @@ def _raise_fd_limit(log):
     want = 16384
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        ceiling = hard if hard != resource.RLIM_INFINITY else want
+        ceiling = hard if hard != resource.RLIM_INFINITY else max(soft, want)
         new_soft = min(max(soft, want), ceiling)
         if new_soft > soft:
             resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
@@ -83,7 +83,8 @@ async def serve(ctx, log):
     tasks = [asyncio.create_task(_periodic_save(prox, stop))]
     if ctx.watch_network:
         tasks.append(asyncio.create_task(
-            netcheck.monitor(ctx, resolver, log, stop)
+            netcheck.monitor(ctx, resolver, log, stop,
+                             on_change=prox.forget_verification)
         ))
 
     async with server:
@@ -121,6 +122,9 @@ def main(argv=None):
     log = Log("debug" if args.verbose else "info")
 
     if args.test is not None:
+        # Keep every connection the test makes in the reserved source-port
+        # band, so "cover all apps" does not route them back into the engine.
+        ctx.transparent = True
         resolver = Resolver(ctx, log)
         asyncio.run(probe.run(args.test, resolver, ctx, log))
         return 0
