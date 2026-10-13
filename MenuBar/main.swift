@@ -6,10 +6,20 @@ import Cocoa
 // path (e.g. the old DMG/translocated instance that is handing off to the
 // freshly installed /Applications one) is on its way out, so let this one take
 // over instead of exiting into nothing.
+//
+// `--replace <pid>` names the one instance that does not count: an older copy
+// that noticed the app had been updated underneath it, started this one, and
+// is quitting (see AppDelegate.relaunchIfReplaced).
 let myPath = Bundle.main.bundlePath
+var replacing: pid_t = 0
+if let flag = CommandLine.arguments.firstIndex(of: "--replace"),
+   flag + 1 < CommandLine.arguments.count {
+    replacing = pid_t(CommandLine.arguments[flag + 1]) ?? 0
+}
 let duplicate = NSWorkspace.shared.runningApplications.contains {
     $0.bundleIdentifier == Bundle.main.bundleIdentifier
         && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        && $0.processIdentifier != replacing
         && ($0.bundleURL?.path == myPath)
 }
 if duplicate {

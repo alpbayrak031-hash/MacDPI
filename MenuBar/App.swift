@@ -10,6 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var port = 8881
     private var outageChecks = 0
     private var warnedAboutOutage = false
+    /// The modification date of our own executable when we started running it.
+    private let launchedBinary = AppDelegate.binaryDate()
 
     // MARK: - lifecycle
 
@@ -87,10 +89,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.terminate(nil)
             return true
         }
+        // An older copy may still be running from Applications. It has to go
+        // first: macOS will not start a second instance of a running app, so
+        // opening the new one would only bring the old one forward, and the
+        // update would not take effect until the next login.
+        quitOtherInstances()
         // Launch the installed copy and hand off to it.
-        _ = shell("/usr/bin/open", [dest])
+        _ = shell("/usr/bin/open", ["-n", dest])
         NSApp.terminate(nil)
         return true
+    }
+
+    private func quitOtherInstances() {
+        let me = ProcessInfo.processInfo.processIdentifier
+        func others() -> [NSRunningApplication] {
+            NSWorkspace.shared.runningApplications.filter {
+                $0.bundleIdentifier == Bundle.main.bundleIdentifier
+                    && $0.processIdentifier != me
+            }
+        }
+        others().forEach { $0.terminate() }
+        for _ in 0..<20 where !others().isEmpty {
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        // One stuck behind a dialog will not act on a polite request.
+        others().forEach { $0.forceTerminate() }
+    }
+
+    private static func binaryDate() -> Date? {
+        guard let path = Bundle.main.executablePath else { return nil }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return attributes?[.modificationDate] as? Date
+    }
+
+    /// If the app has been replaced on disk while running - an update dragged
+    /// over it in Finder - this process is still the old code, and stays so
+    /// until the next login, because opening the app again only brings the
+    /// running copy forward. So notice, and hand over to the new copy, which
+    /// then restarts the engine on its own version (Installer.bringUpToDate).
+    private func relaunchIfReplaced() {
+        guard let then = launchedBinary, let now = AppDelegate.binaryDate(),
+              now != then else { return }
+        // Mid-copy the bundle is incomplete. A full, intact one verifies
+        // against its signature; until then, look again on the next tick.
+        let bundle = Bundle.main.bundlePath
+        let check = Process()
+        check.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        check.arguments = ["--verify", "--deep", "--strict", bundle]
+        check.standardOutput = Pipe()
+        check.standardError = Pipe()
+        guard (try? check.run()) != nil else { return }
+        check.waitUntilExit()
+        guard check.terminationStatus == 0 else { return }
+
+        let me = ProcessInfo.processInfo.processIdentifier
+        _ = shell("/usr/bin/open", ["-n", bundle, "--args", "--replace", String(me)])
+        NSApp.terminate(nil)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -100,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - state
 
     private func refresh() {
+        relaunchIfReplaced()
         status = EngineStatus.fetch()
         port = status?.port ?? 8881
         proxyOn = SystemProxy.isEnabled(port: port)
