@@ -219,6 +219,11 @@ carries the engine inside it, so there's nothing else to ship.
 > xattr -dr com.apple.quarantine /Applications/MacDPI.app
 > ```
 
+**Updating:** open the new version's disk image and let MacDPI move itself to
+Applications — it replaces the old copy, keeps your settings and restarts on the
+new version. An older copy opened by mistake hands over to the newer installed
+one instead of downgrading it.
+
 `build.sh` automatically uses a Developer ID if the build machine has one.
 
 ---

@@ -23,6 +23,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // that disappears - the app opens but the proxy never actually works.
         if relocateToApplicationsIfNeeded() { return }
 
+        // A newer copy elsewhere is the one that runs MacDPI here. Taking the
+        // engine over from it would downgrade a working install.
+        if let newer = Installer.newerCopyInCharge() {
+            stepAside(for: newer)
+            return
+        }
+
         // Only once we know we are the installed copy: doing this from a disk
         // image would point the engine job at a path that is about to vanish.
         Installer.bringUpToDate()
@@ -57,6 +64,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // leave it be rather than fight the user's own placement.
         if bundlePath.hasPrefix("/Applications/") && !translocated && !onDMG {
             return false
+        }
+
+        // Applications already holds this version or a newer one. Copying over
+        // it would at best change nothing and at worst downgrade it - which is
+        // what happens when an old copy kept beside the disk images is opened
+        // by mistake - so hand over to the installed copy instead.
+        if let installed = AppVersion.of(bundle: dest),
+           !AppVersion.isNewer(AppVersion.current, than: installed) {
+            stepAside(for: dest)
+            return true
         }
 
         let box = NSAlert()
@@ -98,6 +115,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = shell("/usr/bin/open", ["-n", dest])
         NSApp.terminate(nil)
         return true
+    }
+
+    /// Hand over to an installed copy at least as new as this one, and quit.
+    private func stepAside(for installed: String) {
+        let theirs = AppVersion.of(bundle: installed) ?? "a newer version"
+        if AppVersion.isNewer(theirs, than: AppVersion.current) {
+            alert("A newer MacDPI is already installed",
+                  "This copy is version \(AppVersion.current), but version \(theirs) "
+                  + "is installed at \(installed). MacDPI will open that one instead. "
+                  + "You can delete this copy.")
+        }
+        // A quarantined copy would itself be opened from a temporary, read-only
+        // location by macOS, and would then try to hand over all over again.
+        _ = shell("/usr/bin/xattr", ["-dr", "com.apple.quarantine", installed])
+        _ = shell("/usr/bin/open", [installed])
+        NSApp.terminate(nil)
     }
 
     private func quitOtherInstances() {

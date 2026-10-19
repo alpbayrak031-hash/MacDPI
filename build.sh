@@ -8,7 +8,7 @@ APP="$BUILD/MacDPI.app"
 VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$DIR/macdpi/__init__.py")"
 MIN_MACOS="12.0"
 
-SOURCES=(Control.swift System.swift Paths.swift Installer.swift App.swift main.swift)
+SOURCES=(Control.swift System.swift Paths.swift Version.swift Installer.swift App.swift main.swift)
 
 echo "Building MacDPI $VERSION"
 rm -rf "$BUILD"

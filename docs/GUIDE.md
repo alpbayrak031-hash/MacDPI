@@ -122,6 +122,18 @@ normally. Alternatively:
 xattr -dr com.apple.quarantine /Applications/MacDPI.app
 ```
 
+### Updating
+
+Open the new version's disk image and run MacDPI from it: it offers to move
+itself to Applications, replaces the old copy, keeps your settings, and
+restarts the engine on the new version. Dragging the new app over the old one
+in Finder works too — the running copy notices within a few seconds and hands
+over to the new one.
+
+An older copy never displaces a newer one. Open a stale copy by mistake — one
+kept beside the disk images, say — and it hands over to the installed version
+instead of installing itself over it or taking the engine over.
+
 ### Why it does not install into the system
 
 Nothing here runs as root, and that is deliberate. The engine is an ordinary

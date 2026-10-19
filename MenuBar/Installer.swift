@@ -60,6 +60,21 @@ enum Installer {
             keepAlive: false)
     }
 
+    /// A copy of the app newer than this one that the engine job currently
+    /// runs from, or nil. A copy that finds one must step aside rather than
+    /// re-point the job at itself: that re-pointing is exactly how a stray old
+    /// copy, opened by mistake, quietly downgraded a working install.
+    static func newerCopyInCharge() -> String? {
+        guard let dir = job(LaunchAgent.engineLabel)?["WorkingDirectory"] as? String,
+              dir != Paths.engineDir,
+              let bundle = AppVersion.bundle(ofEngineDir: dir),
+              FileManager.default.fileExists(atPath: dir + "/macdpi/__main__.py"),
+              let theirs = AppVersion.of(bundle: bundle),
+              AppVersion.isNewer(theirs, than: AppVersion.current)
+        else { return nil }
+        return bundle
+    }
+
     /// Bring an existing install in line with this copy of the app.
     ///
     /// The engine job embeds the app's path and the engine's command line, and
@@ -88,9 +103,7 @@ enum Installer {
                                         transparent: transparent) {
             stale = true
         }
-        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"]
-            as? String ?? ""
-        let outdated = EngineStatus.fetch().map { $0.version != appVersion } ?? false
+        let outdated = EngineStatus.fetch().map { $0.version != AppVersion.current } ?? false
 
         if stale {
             installEngineAgent(port: port, transparent: transparent)
