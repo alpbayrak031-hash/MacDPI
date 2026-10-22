@@ -1,3 +1,3 @@
 """macdpi - a local DPI-circumvention proxy for macOS."""
 
-__version__ = "1.1.1"
+__version__ = "1.2.1"

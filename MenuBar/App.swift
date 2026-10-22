@@ -39,7 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         refresh()
-        if !LaunchAgent.isInstalled(LaunchAgent.engineLabel) {
+        if !Installer.isConfigured {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.runFirstRunSetup() }
         }
 
@@ -204,7 +204,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         outageChecks += 1
-        guard outageChecks >= 3, !warnedAboutOutage else { return }
+        // Before bothering the user, try to fix it silently. The engine agent
+        // may simply not be loaded (common right after a reboot), and loading
+        // it is a passwordless user-domain action. Recreate it if the plist is
+        // gone, then bootstrap it. Only if it still won't answer do we nag.
+        if outageChecks == 3 {
+            DispatchQueue.global().async {
+                Installer.bringUpToDate()
+                if EngineStatus.fetch() == nil {
+                    LaunchAgent.reload(LaunchAgent.engineLabel)
+                }
+                DispatchQueue.main.async { self.refresh() }
+            }
+            return
+        }
+        guard outageChecks >= 6, !warnedAboutOutage else { return }
         warnedAboutOutage = true
 
         let box = NSAlert()
@@ -673,6 +687,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         LaunchAgent.remove(LaunchAgent.engineLabel)
         LaunchAgent.remove(LaunchAgent.barLabel)
+        Installer.clearConfigured()   // a real removal: next open is a fresh setup
         alert("MacDPI removed", "Your network settings are back to normal.")
         NSApp.terminate(nil)
     }
@@ -712,6 +727,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         Installer.installEngineAgent()
         Installer.installMenuBarAgent()
+        Installer.markConfigured()
         bringEngineUp()
         guard status != nil else { return }
 

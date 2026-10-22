@@ -40,9 +40,15 @@ async def serve(ctx, log):
     resolver = Resolver(ctx, log)
     prox = Proxy(ctx, resolver, log)
 
-    if ctx.wait_for_network > 0:
-        await netcheck.wait_until_online(ctx, log, ctx.wait_for_network)
-
+    # Start listening and answering the control socket right away, even before
+    # the network is up. Blocking the listeners on a network check (as earlier
+    # versions did) meant that at login the engine looked dead for up to the
+    # whole wait - the menu bar then treated a perfectly healthy, still-starting
+    # engine as an outage and tore it down, which is exactly the "fails to start
+    # after a reboot" cycle. Connections that arrive before the network is ready
+    # simply fail their upstream and the client retries; the resolver's own
+    # backoff keeps that from being a lookup storm. The network wait now only
+    # arms DoH and logs, in the background (see below).
     server = await asyncio.start_server(
         prox.handle, ctx.host, ctx.port, reuse_address=True, backlog=512
     )
@@ -67,6 +73,22 @@ async def serve(ctx, log):
             tproxy_servers.append(srv)
             log.info(f"transparent listener on 127.0.0.1:{tport} "
                      f"(redirected :{uport})")
+
+        if ctx.mc_ports:
+            async def raw_handler(reader, writer):
+                await prox.handle_transparent_raw(reader, writer, None)
+            try:
+                srv = await asyncio.start_server(
+                    raw_handler, "127.0.0.1", ctx.tproxy_raw_port,
+                    reuse_address=True, backlog=512)
+                tproxy_servers.append(srv)
+                ports = ",".join(str(p) for p in ctx.mc_ports)
+                log.info(f"transparent listener on 127.0.0.1:{ctx.tproxy_raw_port} "
+                         f"(redirected Minecraft :{ports})")
+            except OSError as exc:
+                log.error("cannot open Minecraft transparent listener on "
+                          f"{ctx.tproxy_raw_port}: {exc}")
+
         log.info("transparent mode on: load the pf rules to cover all apps")
 
     stop = asyncio.Event()
@@ -81,6 +103,13 @@ async def serve(ctx, log):
         log.warn(f"control socket unavailable: {exc}")
 
     tasks = [asyncio.create_task(_periodic_save(prox, stop))]
+    if ctx.wait_for_network > 0:
+        # Background only: the listeners are already up. This just notes when
+        # the connection is really ready (handy in the log) and lets the
+        # resolver arm DoH the moment it is, without holding up startup.
+        tasks.append(asyncio.create_task(
+            netcheck.wait_until_online(ctx, log, ctx.wait_for_network)
+        ))
     if ctx.watch_network:
         tasks.append(asyncio.create_task(
             netcheck.monitor(ctx, resolver, log, stop,

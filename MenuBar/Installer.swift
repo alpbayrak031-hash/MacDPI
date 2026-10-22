@@ -33,6 +33,28 @@ enum Installer {
             highFileLimit: true)
     }
 
+    /// Marker written once setup has completed, so a later launch can tell
+    /// "never set up" (do the first-run flow) from "set up, but the launchd
+    /// job went missing" (silently recreate it, no reinstall, no password).
+    private static var configuredMarker: String { Paths.stateDir + "/.configured" }
+
+    static var isConfigured: Bool {
+        // The marker is authoritative; the job still being installed counts too,
+        // so installs that predate the marker aren't treated as brand new.
+        FileManager.default.fileExists(atPath: configuredMarker)
+            || LaunchAgent.isInstalled(LaunchAgent.engineLabel)
+    }
+
+    static func markConfigured() {
+        try? FileManager.default.createDirectory(
+            atPath: Paths.stateDir, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: configuredMarker, contents: nil)
+    }
+
+    static func clearConfigured() {
+        try? FileManager.default.removeItem(atPath: configuredMarker)
+    }
+
     private static func job(_ label: String) -> [String: Any]? {
         guard let data = try? Data(contentsOf: LaunchAgent.plistURL(label)) else {
             return nil
@@ -84,9 +106,24 @@ enum Installer {
     /// rewritten if it no longer matches, and the engine restarted if it is
     /// not the version this app ships.
     static func bringUpToDate() {
-        guard LaunchAgent.isInstalled(LaunchAgent.engineLabel),
-              let engine = job(LaunchAgent.engineLabel)
-        else { return }
+        // The launchd job went missing (a past "Remove", a cleaner, a botched
+        // update) but setup was done before: recreate it and load it, rather
+        // than leaving the user with a dead engine they have to reinstall. This
+        // is the self-heal that turns "fails to start after a reboot" into
+        // "just works". No password: writing the agent and loading it are both
+        // user-domain operations; the system-proxy setting persists on its own.
+        if !LaunchAgent.isInstalled(LaunchAgent.engineLabel) {
+            markConfigured()
+            // If the pf "cover all apps" daemon is still loaded, the engine
+            // must come back up WITH its transparent listeners or pf would
+            // redirect traffic to ports nothing is listening on.
+            installEngineAgent(transparent: Transparent.daemonInstalled())
+            installMenuBarAgent()
+            LaunchAgent.reload(LaunchAgent.engineLabel)
+            return
+        }
+        guard let engine = job(LaunchAgent.engineLabel) else { return }
+        markConfigured()
 
         // Carry over what the user had: the port, and whether "all apps" is on.
         let installed = engine["ProgramArguments"] as? [String] ?? []
