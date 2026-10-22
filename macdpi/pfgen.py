@@ -60,11 +60,23 @@ def resolve_bypass(entries):
     return out
 
 
-def build_ruleset(entries, tls_port=8443, http_port=8480) -> str:
+def build_ruleset(entries, tls_port=8443, http_port=8480,
+                  raw_port=8425, mc_ports=(25565,)) -> str:
     """Produce the full pf.conf text for transparent interception."""
     bypass = ALWAYS_BYPASS + resolve_bypass(entries)
     # A pf table literal: one indented, backslash-continued list.
     table = ", \\\n    ".join(bypass)
+
+    # Minecraft Java multiplayer is redirected whole, by port, to the raw
+    # listener - it is neither HTTP nor TLS, so the engine reads the server
+    # name from the game's own handshake rather than an SNI or Host header.
+    mc_rdr = "".join(
+        "\nrdr pass on lo0 inet proto tcp from any to !<macdpi_bypass> "
+        f"port {port} -> 127.0.0.1 port {raw_port}" for port in mc_ports)
+    mc_route = "".join(
+        "\npass out quick route-to (lo0 127.0.0.1) inet proto tcp from any "
+        f"to !<macdpi_bypass> port {port} flags S/SA keep state"
+        for port in mc_ports)
 
     # pf demands rules grouped by class in a fixed order: normalization, then
     # translation (nat/rdr), then filtering. Apple's own anchors span all three
@@ -89,7 +101,7 @@ rdr-anchor "com.apple/*"
 # these rdr rules then catch them - that is what makes the Mac's own traffic
 # covered, not just traffic forwarded from other devices.
 rdr pass on lo0 inet proto tcp from any to !<macdpi_bypass> port 443 -> 127.0.0.1 port {tls_port}
-rdr pass on lo0 inet proto tcp from any to !<macdpi_bypass> port 80  -> 127.0.0.1 port {http_port}
+rdr pass on lo0 inet proto tcp from any to !<macdpi_bypass> port 80  -> 127.0.0.1 port {http_port}{mc_rdr}
 
 # --- filtering --------------------------------------------------------------
 dummynet-anchor "com.apple/*"
@@ -100,7 +112,7 @@ anchor "com.apple/*"
 pass out quick inet proto tcp from any port {SRC_PORT_LOW}:{SRC_PORT_HIGH} to any flags S/SA keep state
 # Everything else on 80/443 is forced onto lo0, where the rdr rules above act.
 pass out quick route-to (lo0 127.0.0.1) inet proto tcp from any to !<macdpi_bypass> port 443 flags S/SA keep state
-pass out quick route-to (lo0 127.0.0.1) inet proto tcp from any to !<macdpi_bypass> port 80  flags S/SA keep state
+pass out quick route-to (lo0 127.0.0.1) inet proto tcp from any to !<macdpi_bypass> port 80  flags S/SA keep state{mc_route}
 
 load anchor "com.apple" from "/etc/pf.anchors/com.apple"
 """

@@ -18,6 +18,7 @@ from .tlsclient import TLSStream
 TYPE_A = 1
 TYPE_AAAA = 28
 TYPE_CNAME = 5
+TYPE_SRV = 33
 
 # Lookups run over a few keep-alive connections at once, so a page that needs
 # thirty names does not queue them all behind a single one.
@@ -27,11 +28,20 @@ PROVIDER_COOLDOWN = 120
 MAX_RESPONSE = 65536
 
 
+def _encode_label(label: str) -> bytes:
+    # SRV names carry underscore labels (_minecraft._tcp), which IDNA rejects;
+    # those are plain ASCII, so only non-ASCII labels need IDNA at all.
+    try:
+        return label.encode("ascii")
+    except UnicodeEncodeError:
+        return label.encode("idna")
+
+
 def encode_query(name: str, qtype: int) -> bytes:
     qid = random.getrandbits(16)
     header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
     qname = b"".join(
-        bytes([len(l)]) + l for l in (p.encode("idna") for p in name.split(".") if p)
+        bytes([len(l)]) + l for l in (_encode_label(p) for p in name.split(".") if p)
     ) + b"\x00"
     return header + qname + struct.pack(">HH", qtype, 1)
 
@@ -44,6 +54,61 @@ def _skip_name(buf: bytes, pos: int) -> int:
         if ln & 0xC0 == 0xC0:
             return pos + 2
         pos += 1 + ln
+
+
+def _read_name(buf: bytes, pos: int, _depth: int = 0):
+    """Read a DNS name at `pos`, following compression pointers.
+
+    Returns (dotted_name, position_after_the_name_field). Only the bytes up to
+    the first pointer belong to this field; a pointer's target is read but does
+    not advance the field position.
+    """
+    labels = []
+    end = None
+    while _depth < 32:
+        if pos >= len(buf):
+            break
+        length = buf[pos]
+        if length == 0:
+            pos += 1
+            break
+        if length & 0xC0 == 0xC0:                  # compression pointer
+            if pos + 1 >= len(buf):
+                break
+            target = ((length & 0x3F) << 8) | buf[pos + 1]
+            if end is None:
+                end = pos + 2
+            sub, _ = _read_name(buf, target, _depth + 1)
+            if sub:
+                labels.append(sub)
+            pos = end
+            break
+        labels.append(buf[pos + 1:pos + 1 + length].decode("latin-1"))
+        pos += 1 + length
+    return ".".join(l for l in labels if l), (end if end is not None else pos)
+
+
+def decode_srv(buf: bytes):
+    """Return a list of (priority, weight, port, target) from SRV answers."""
+    if len(buf) < 12:
+        return []
+    qd, an = struct.unpack(">HH", buf[4:8])
+    pos = 12
+    for _ in range(qd):
+        pos = _skip_name(buf, pos) + 4
+    out = []
+    for _ in range(an):
+        pos = _skip_name(buf, pos)
+        rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", buf[pos:pos + 10])
+        pos += 10
+        rec_end = pos + rdlen
+        if rtype == TYPE_SRV and rdlen >= 7:
+            priority, weight, port = struct.unpack(">HHH", buf[pos:pos + 6])
+            target, _ = _read_name(buf, pos + 6)
+            if target:
+                out.append((priority, weight, port, target.rstrip(".")))
+        pos = rec_end
+    return out
 
 
 def decode_answers(buf: bytes):
@@ -339,8 +404,8 @@ class Resolver:
             raise
         return _Conn(stream, provider, strategy)
 
-    async def _query(self, conn, host: str, qtype: int):
-        body = encode_query(host, qtype)
+    async def _query_raw(self, conn, name: str, qtype: int) -> bytes:
+        body = encode_query(name, qtype)
         _ip, dhost, dpath = conn.provider
         req = (
             f"POST {dpath} HTTP/1.1\r\n"
@@ -356,7 +421,11 @@ class Resolver:
             _read_response(conn), self.ctx.dns_timeout)
         if status != 200:
             raise _ProviderError(f"HTTP {status} from {dhost}")
+        conn.fresh = False
+        return payload
 
+    async def _query(self, conn, host: str, qtype: int):
+        payload = await self._query_raw(conn, host, qtype)
         ips = []
         try:
             for rtype, rdata, _ttl in decode_answers(payload):
@@ -366,9 +435,51 @@ class Resolver:
                 if ip:
                     ips.append(ip)
         except (IndexError, struct.error) as exc:
-            raise _ProviderError(f"malformed DNS answer from {dhost}") from exc
-        conn.fresh = False
+            raise _ProviderError("malformed DNS answer") from exc
         return ips
+
+    async def resolve_srv(self, name: str):
+        """Resolve an SRV record. Returns (host, port) sorted best-first, or []."""
+        if not self.ctx.doh or time.time() < self._doh_broken_until:
+            return []
+        if self._slots is None:
+            self._slots = asyncio.Semaphore(DOH_CONNECTIONS)
+        async with self._slots:
+            for _attempt in range(3):
+                conn = await self._checkout()
+                try:
+                    payload = await self._query_raw(conn, name, TYPE_SRV)
+                except _RETRYABLE as exc:
+                    conn.close()
+                    if conn.fresh:
+                        self._demote(conn.provider, exc)
+                    continue
+                self._checkin(conn)
+                try:
+                    records = decode_srv(payload)
+                except (IndexError, struct.error):
+                    return []
+                # Lowest priority first, then higher weight; "." means no service.
+                records.sort(key=lambda r: (r[0], -r[1]))
+                return [(t, p) for _pri, _w, p, t in records if t != "."]
+        return []
+
+    async def resolve_service(self, host: str, default_port: int):
+        """Resolve a host the Minecraft way: SRV first, then a plain A/AAAA.
+
+        Returns (ip_list, port). SRV lets a server publish its real address
+        under a name the player never types, so it must be honoured or those
+        servers are unreachable.
+        """
+        try:
+            srv = await self.resolve_srv("_minecraft._tcp." + host)
+        except Exception:                                      # noqa: BLE001
+            srv = []
+        for target, port in srv:
+            ips = await self.resolve(target)
+            if ips:
+                return ips, port
+        return await self.resolve(host), default_port
 
 
 # --- minimal HTTP/1.1 response reading -------------------------------------

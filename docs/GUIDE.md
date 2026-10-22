@@ -93,11 +93,23 @@ completely. Private, local, link-local and multicast ranges are always excluded.
 Use this for anything that misbehaves when routed — a bank, a corporate VPN
 endpoint — or to keep a specific service off the path.
 
+**Minecraft Java multiplayer.** Game-server connections are not HTTP or TLS,
+so they are handled on their own path: TCP port 25565 is redirected to a third
+listener, where the engine reads the server address from Minecraft's own
+Handshake packet, resolves it over DoH (honouring `_minecraft._tcp` SRV records,
+so servers that publish a hidden address still connect), and splits the first
+packet through that address - the plaintext field a DPI box would match on.
+There is no certificate to verify as with TLS, so the split is applied
+unconditionally; a server reassembles the stream normally. The ports treated as
+Minecraft are set with `--minecraft-ports` (default `25565`, or `off`). The
+account sign-in itself is ordinary HTTPS and is already covered.
+
 **What still isn't covered.** Connections on 80/443 with no SNI and no Host
 header can't be routed by name and are dropped rather than guessed at; these
 are rare for real web traffic, and the exclude list handles any that matter.
-QUIC/HTTP-3 (UDP) is not redirected; apps generally fall back to TCP. IPv6 is
-left untouched for now.
+QUIC/HTTP-3 (UDP) is not redirected; apps generally fall back to TCP. Minecraft
+*Bedrock* and most game voice/netcode are UDP and need a VPN. IPv6 is left
+untouched for now.
 
 **Turning it off** removes the `pf` rule, restores your normal `pf` ruleset
 (pf is left enabled with Apple's defaults, so nothing else that relies on it
@@ -309,6 +321,7 @@ Useful options to `start`:
                       dnssb, nextdns, controld, a URL, or off)
     --port 8881       change the listen port
 -v, --verbose         log every connection and the strategy it used
+    --minecraft-ports 25565  TCP ports covered as Minecraft Java, or 'off'
     --wait-for-network 300   wait N seconds for a connection before serving
     --no-watch-network       do not flush DNS when the connection returns
 ```
@@ -360,6 +373,7 @@ macdpi/netcheck.py    reachability and network-change detection
 macdpi/control.py     Unix-socket control channel for the menu bar
 macdpi/transparent... transparent routing lives in proxy.handle_transparent
 macdpi/pfgen.py       generates the pf ruleset for 'cover all apps'
+macdpi/mcproto.py     parses the Minecraft handshake for transparent routing
 macdpi/probe.py       the --test report
 macdpi/config.py      options and logging
 dpictl                start/stop, system proxy, autostart

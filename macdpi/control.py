@@ -141,6 +141,7 @@ class ControlServer:
             "transparent": self.ctx.transparent,
             "tproxy_tls_port": self.ctx.tproxy_tls_port,
             "tproxy_http_port": self.ctx.tproxy_http_port,
+            "minecraft_ports": self.ctx.mc_ports,
             "bypass_count": len(_load_bypass()),
         }
 
@@ -169,6 +170,8 @@ class ControlServer:
             _load_bypass(),
             tls_port=self.ctx.tproxy_tls_port,
             http_port=self.ctx.tproxy_http_port,
+            raw_port=self.ctx.tproxy_raw_port,
+            mc_ports=self.ctx.mc_ports or [],
         )
         return {"ok": True, "ruleset": text}
 

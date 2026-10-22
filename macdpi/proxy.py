@@ -15,7 +15,7 @@ import ssl
 import struct
 import time
 
-from . import desync, tls
+from . import desync, mcproto, tls
 from .config import STATE_DIR, STATE_FILE
 from .netio import Upstream
 from .tlsclient import TLSStream, make_ssl_context
@@ -272,6 +272,61 @@ class Proxy:
             self.stats["failed"] += 1
             self.log.debug(f"transparent {peer} error: {exc!r}")
         finally:
+            _close(writer)
+
+    async def handle_transparent_raw(self, reader, writer, upstream_port):
+        """Handle a pf-redirected Minecraft (Java) multiplayer connection.
+
+        As in handle_transparent there is no proxy handshake and no original
+        destination IP to recover, so the server address is read from
+        Minecraft's own Handshake packet and resolved over DoH - which also
+        sidesteps a poisoned DNS answer the client would otherwise have used.
+        There is no certificate to verify here, so rather than probe strategies
+        the first packet is simply split through the hostname, the plaintext
+        field a DPI box matches on; the server reassembles the stream as normal.
+        """
+        peer = writer.get_extra_info("peername")
+        up = None
+        try:
+            first = await asyncio.wait_for(reader.read(65536), 30)
+            if not first:
+                return
+            first = await _complete_packet(reader, first)
+            hs = mcproto.parse_handshake(first)
+            if hs is None:
+                # A legacy ping, a partial read, or not Minecraft at all. With
+                # no hostname there is nothing to route by, so drop it.
+                self.log.debug(f"minecraft: unroutable first packet from {peer}")
+                return
+
+            self.stats["connections"] += 1
+            ips, port = await self.resolver.resolve_service(hs.host, hs.port)
+            if not ips:
+                self.stats["failed"] += 1
+                self.log.warn(f"{hs.host}:{hs.port} unreachable: no address")
+                return
+            up, _ip = await self._dial(ips[:self.ctx.max_ips], port, None)
+
+            pos = mcproto.split_position(hs)
+            await up.send(first[:pos])
+            if self.ctx.delay:
+                await asyncio.sleep(self.ctx.delay)
+            await up.send(first[pos:])
+
+            self._record(hs.host, port, "mc-split")
+            if self.ctx.verbose:
+                self.log.info(f"minecraft {hs.host}:{port} "
+                              f"(state {hs.next_state}) via mc-split")
+            await self._relay(reader, writer, up)
+            up = None                               # _relay owns it now
+        except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as exc:                              # noqa: BLE001
+            self.stats["failed"] += 1
+            self.log.debug(f"minecraft {peer} error: {exc!r}")
+        finally:
+            if up is not None:
+                up.close()
             _close(writer)
 
     async def _open(self, host, port, first, tls_expected, http=False):
@@ -785,6 +840,30 @@ async def _complete_record(reader, first, timeout=2.0, limit=65536):
                                   and tls.record_missing(first) > 0)
 
     while wanted():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            more = await asyncio.wait_for(reader.read(65536), remaining)
+        except asyncio.TimeoutError:
+            break
+        if not more:
+            break
+        first += more
+    return first
+
+
+async def _complete_packet(reader, first, timeout=2.0, limit=4096):
+    """Read on until Minecraft's first packet is whole (it is tiny).
+
+    The length-prefixed Handshake almost always arrives in one segment, but a
+    client is free to dribble it; the hostname may be in a part not yet read.
+    """
+    deadline = time.monotonic() + timeout
+    while len(first) < limit:
+        need = mcproto.packet_length(first)
+        if need is not None and len(first) >= need:
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break

@@ -137,8 +137,12 @@ still no man-in-the-middle and no need for the kernel headers Apple doesn't ship
   excluded.
 - Connections on 80/443 with **no SNI and no Host header** can't be routed by
   name and are dropped rather than guessed at (rare for real web traffic).
-- **UDP is not covered** — QUIC/HTTP-3 falls back to TCP; game traffic and voice
-  (Roblox, Discord voice, etc.) run over UDP and need a VPN, not this.
+- **Minecraft Java multiplayer is covered** — its game connections (TCP 25565)
+  are redirected too, with the server name read from the game's own handshake,
+  resolved over DoH (SRV records included) and the first packet split through
+  that name. Sign-in already works over HTTPS; this adds the game servers.
+- **UDP is still not covered** — QUIC/HTTP-3 falls back to TCP; Minecraft
+  *Bedrock*, Discord voice and most game netcode run over UDP and need a VPN.
 
 ---
 

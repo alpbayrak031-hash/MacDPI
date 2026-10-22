@@ -97,6 +97,12 @@ class Context:
     transparent: bool = False
     tproxy_tls_port: int = 8443
     tproxy_http_port: int = 8480
+    # A third transparent listener for raw, non-HTTP TCP protocols that are
+    # redirected whole (no per-protocol port), currently Minecraft Java. The
+    # server address is read from the protocol itself and resolved over DoH.
+    tproxy_raw_port: int = 8425
+    # TCP ports treated as Minecraft Java multiplayer when covering all apps.
+    mc_ports: list = field(default_factory=lambda: [25565])
 
 
 class Log:
@@ -163,6 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tproxy-http-port", type=int, default=8480,
                    help="transparent listener port for redirected :80 "
                         "(default: %(default)s)")
+    p.add_argument("--tproxy-raw-port", type=int, default=8425,
+                   help="transparent listener port for redirected raw TCP "
+                        "(Minecraft) (default: %(default)s)")
+    p.add_argument("--minecraft-ports", default="25565",
+                   help="comma-separated TCP ports covered as Minecraft Java "
+                        "when covering all apps, or 'off' (default: %(default)s)")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="log every connection and the strategy used")
     p.add_argument("--test", nargs="*", metavar="HOST",
@@ -185,7 +197,13 @@ def context_from_args(args) -> Context:
         transparent=args.transparent,
         tproxy_tls_port=args.tproxy_tls_port,
         tproxy_http_port=args.tproxy_http_port,
+        tproxy_raw_port=args.tproxy_raw_port,
     )
+    mc = args.minecraft_ports.strip().lower()
+    if mc in ("off", "no", "none", ""):
+        ctx.mc_ports = []
+    else:
+        ctx.mc_ports = sorted({int(x) for x in mc.split(",") if x.strip()})
     if args.mode != "auto":
         ctx.ladder = [args.mode]
 
