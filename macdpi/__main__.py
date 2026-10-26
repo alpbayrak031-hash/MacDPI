@@ -73,23 +73,29 @@ async def serve(ctx, log):
             tproxy_servers.append(srv)
             log.info(f"transparent listener on 127.0.0.1:{tport} "
                      f"(redirected :{uport})")
-
-        if ctx.mc_ports:
-            async def raw_handler(reader, writer):
-                await prox.handle_transparent_raw(reader, writer, None)
-            try:
-                srv = await asyncio.start_server(
-                    raw_handler, "127.0.0.1", ctx.tproxy_raw_port,
-                    reuse_address=True, backlog=512)
-                tproxy_servers.append(srv)
-                ports = ",".join(str(p) for p in ctx.mc_ports)
-                log.info(f"transparent listener on 127.0.0.1:{ctx.tproxy_raw_port} "
-                         f"(redirected Minecraft :{ports})")
-            except OSError as exc:
-                log.error("cannot open Minecraft transparent listener on "
-                          f"{ctx.tproxy_raw_port}: {exc}")
-
         log.info("transparent mode on: load the pf rules to cover all apps")
+
+    # The Minecraft route listener runs ALWAYS, not only under "cover all apps".
+    # It is a passive loopback listener that costs nothing until something
+    # connects to it (the companion java agent redirects the game's connection
+    # here). Keeping it off the pf path is deliberate: when "cover all apps" is
+    # on, that path is funnelling every app's web traffic through the engine and
+    # can get swamped on a hostile network - which would make game joins flaky.
+    # A standalone listener stays responsive regardless.
+    if ctx.mc_ports:
+        async def raw_handler(reader, writer):
+            await prox.handle_transparent_raw(reader, writer, None)
+        try:
+            srv = await asyncio.start_server(
+                raw_handler, "127.0.0.1", ctx.tproxy_raw_port,
+                reuse_address=True, backlog=512)
+            tproxy_servers.append(srv)
+            ports = ",".join(str(p) for p in ctx.mc_ports)
+            log.info(f"Minecraft route listener on 127.0.0.1:{ctx.tproxy_raw_port} "
+                     f"(for the MacDPI game-route agent; ports {ports})")
+        except OSError as exc:
+            log.error("cannot open Minecraft route listener on "
+                      f"{ctx.tproxy_raw_port}: {exc}")
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
