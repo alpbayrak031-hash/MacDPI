@@ -43,7 +43,7 @@ public final class Agent {
     }
 
     private static void install(String agentArgs, Instrumentation inst) {
-        int port = 8425;
+        int port = 8426;   // 8426 avoids pf's rdr target port (8425)
         boolean force = false;
         if (agentArgs != null) {
             for (String raw : agentArgs.split(",")) {

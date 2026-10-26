@@ -30,3 +30,10 @@ This routes Minecraft through MacDPI; it does not add new evasion power.
 MacDPI still only disguises the first packet (the handshake) and relays the
 rest unchanged, so this helps only where the network blocks on the handshake,
 not where it throttles the ongoing game stream. UDP (Bedrock) is not covered.
+
+## Port note
+Run the route listener on **8426**, not 8425. 8425 is pf's `rdr` *target* for
+port 25565 under "cover all apps", and macOS pf mangles direct connects to a
+redirect-target port - so a listener on 8425 becomes unreachable whenever cover
+all apps is on. 8426 is not a redirect target and stays reachable. The agent
+defaults to 8426; run the engine's route process with `--tproxy-raw-port 8426`.

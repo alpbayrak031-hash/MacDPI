@@ -633,7 +633,7 @@ class Proxy:
                 return "unreachable"
             up = await Upstream.connect(
                 ips[0], port, self.ctx.probe_timeout,
-                reserve_source_port=self.ctx.transparent)
+                reserve_source_port=self.ctx.transparent or self.ctx.minecraft_route)
         except (asyncio.TimeoutError, OSError):
             return "unreachable"
         try:
@@ -655,7 +655,7 @@ class Proxy:
             try:
                 up = await Upstream.connect(
                     ip, port, self.ctx.connect_timeout,
-                    reserve_source_port=self.ctx.transparent)
+                    reserve_source_port=self.ctx.transparent or self.ctx.minecraft_route)
                 return up, ip
             except (OSError, asyncio.TimeoutError) as exc:
                 last = exc

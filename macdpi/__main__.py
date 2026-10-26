@@ -40,6 +40,9 @@ async def serve(ctx, log):
     resolver = Resolver(ctx, log)
     prox = Proxy(ctx, resolver, log)
 
+    if ctx.minecraft_route:
+        return await _serve_minecraft_route(ctx, log, resolver, prox)
+
     # Start listening and answering the control socket right away, even before
     # the network is up. Blocking the listeners on a network check (as earlier
     # versions did) meant that at login the engine looked dead for up to the
@@ -75,27 +78,11 @@ async def serve(ctx, log):
                      f"(redirected :{uport})")
         log.info("transparent mode on: load the pf rules to cover all apps")
 
-    # The Minecraft route listener runs ALWAYS, not only under "cover all apps".
-    # It is a passive loopback listener that costs nothing until something
-    # connects to it (the companion java agent redirects the game's connection
-    # here). Keeping it off the pf path is deliberate: when "cover all apps" is
-    # on, that path is funnelling every app's web traffic through the engine and
-    # can get swamped on a hostile network - which would make game joins flaky.
-    # A standalone listener stays responsive regardless.
-    if ctx.mc_ports:
-        async def raw_handler(reader, writer):
-            await prox.handle_transparent_raw(reader, writer, None)
-        try:
-            srv = await asyncio.start_server(
-                raw_handler, "127.0.0.1", ctx.tproxy_raw_port,
-                reuse_address=True, backlog=512)
-            tproxy_servers.append(srv)
-            ports = ",".join(str(p) for p in ctx.mc_ports)
-            log.info(f"Minecraft route listener on 127.0.0.1:{ctx.tproxy_raw_port} "
-                     f"(for the MacDPI game-route agent; ports {ports})")
-        except OSError as exc:
-            log.error("cannot open Minecraft route listener on "
-                      f"{ctx.tproxy_raw_port}: {exc}")
+    # The Minecraft route listener is NOT started here. It runs in its own
+    # dedicated process (--minecraft-route, see _serve_minecraft_route) on its
+    # own event loop, so the cover-all-apps web flood on this engine can never
+    # starve it - which is exactly what made game joins time out when it shared
+    # this loop.
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -134,6 +121,45 @@ async def serve(ctx, log):
         task.cancel()
     await control.close()
     prox.save_state()
+
+
+async def _serve_minecraft_route(ctx, log, resolver, prox):
+    """A dedicated, lightweight listener just for the Minecraft route agent.
+
+    It binds only the one loopback port the companion java agent connects to,
+    resolves each server over DoH and relays it with evasion. It runs no web
+    proxy and does no per-host strategy probing, so its event loop stays idle
+    between game connections and always accepts promptly - unlike the main
+    engine's loop, which the cover-all-apps web redirect can saturate.
+    """
+    async def raw_handler(reader, writer):
+        await prox.handle_transparent_raw(reader, writer, None)
+    try:
+        server = await asyncio.start_server(
+            raw_handler, "127.0.0.1", ctx.tproxy_raw_port,
+            reuse_address=True, backlog=512)
+    except OSError as exc:
+        log.error(f"cannot open Minecraft route listener on "
+                  f"{ctx.tproxy_raw_port}: {exc}")
+        return
+    ports = ",".join(str(p) for p in ctx.mc_ports)
+    log.info(f"macdpi {__version__} Minecraft route listener on "
+             f"127.0.0.1:{ctx.tproxy_raw_port} (ports {ports})")
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+    tasks = []
+    if ctx.watch_network:
+        tasks.append(asyncio.create_task(
+            netcheck.monitor(ctx, resolver, log, stop,
+                             on_change=prox.forget_verification)))
+    async with server:
+        await stop.wait()
+    log.info("Minecraft route listener shutting down")
+    for task in tasks:
+        task.cancel()
 
 
 def _make_transparent_handler(prox, upstream_port):

@@ -95,6 +95,9 @@ class Context:
     # traffic, and it binds every upstream socket into the reserved source-port
     # band so its own traffic is not redirected back into it.
     transparent: bool = False
+    # Route-only mode: run ONLY the Minecraft route listener (its own process,
+    # its own event loop), so the cover-all-apps web flood can't starve it.
+    minecraft_route: bool = False
     tproxy_tls_port: int = 8443
     tproxy_http_port: int = 8480
     # A third transparent listener for raw, non-HTTP TCP protocols that are
@@ -172,6 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tproxy-raw-port", type=int, default=8425,
                    help="transparent listener port for redirected raw TCP "
                         "(Minecraft) (default: %(default)s)")
+    p.add_argument("--minecraft-route", action="store_true",
+                   help="run ONLY the Minecraft route listener (a dedicated,\n"
+                        "lightweight process the game-route agent connects to)")
     p.add_argument("--minecraft-ports", default="25565",
                    help="comma-separated TCP ports covered as Minecraft Java "
                         "when covering all apps, or 'off' (default: %(default)s)")
@@ -198,6 +204,7 @@ def context_from_args(args) -> Context:
         tproxy_tls_port=args.tproxy_tls_port,
         tproxy_http_port=args.tproxy_http_port,
         tproxy_raw_port=args.tproxy_raw_port,
+        minecraft_route=args.minecraft_route,
     )
     mc = args.minecraft_ports.strip().lower()
     if mc in ("off", "no", "none", ""):
