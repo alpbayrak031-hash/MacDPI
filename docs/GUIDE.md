@@ -104,6 +104,23 @@ unconditionally; a server reassembles the stream normally. The ports treated as
 Minecraft are set with `--minecraft-ports` (default `25565`, or `off`). The
 account sign-in itself is ordinary HTTPS and is already covered.
 
+**Apps that resolve names themselves.** Some apps - Roblox's client is one - look
+a name up through the system resolver *before* connecting, so they never reach
+the proxy, and a network that drops plain DNS for blocked names stops them at
+`DnsResolve` (their log says `HttpError: DnsResolve`). Browsers are unaffected:
+they hand the hostname to the proxy, which resolves it over DoH. The menu's
+**Fix DNS for Apps That Ignore the Proxy** closes that gap: the engine runs a
+small DNS server (`--dns-server`) that answers over DoH, and macOS's resolver is
+pointed at `127.0.0.1` (password once). If DoH cannot answer within three
+seconds, the query goes to the network's own resolvers (read from DHCP), so a
+DoH outage degrades to "as before" instead of taking every name down. Port 53 is
+privileged, but macOS lets an unprivileged process bind it on the wildcard
+address, so the server does - and answers only queries from this Mac, dropping
+anything from the LAN. If the engine dies while DNS points at it, the menu bar
+notices and offers to put DNS back; *Remove MacDPI* restores it too. The toggle
+tests a blocked name right after enabling and reverts itself if it does not
+resolve.
+
 **What still isn't covered.** Connections on 80/443 with no SNI and no Host
 header can't be routed by name and are dropped rather than guessed at; these
 are rare for real web traffic, and the exclude list handles any that matter.
@@ -321,6 +338,7 @@ Useful options to `start`:
                       dnssb, nextdns, controld, a URL, or off)
     --port 8881       change the listen port
 -v, --verbose         log every connection and the strategy it used
+    --dns-server             answer this Mac's DNS lookups over DoH (see above)
     --minecraft-ports 25565  TCP ports covered as Minecraft Java, or 'off'
     --wait-for-network 300   wait N seconds for a connection before serving
     --no-watch-network       do not flush DNS when the connection returns
@@ -374,6 +392,7 @@ macdpi/control.py     Unix-socket control channel for the menu bar
 macdpi/transparent... transparent routing lives in proxy.handle_transparent
 macdpi/pfgen.py       generates the pf ruleset for 'cover all apps'
 macdpi/mcproto.py     parses the Minecraft handshake for transparent routing
+macdpi/dnsserver.py    local DNS server that answers over DoH (system-DNS fix)
 macdpi/probe.py       the --test report
 macdpi/config.py      options and logging
 dpictl                start/stop, system proxy, autostart

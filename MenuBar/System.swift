@@ -286,3 +286,38 @@ enum LaunchAgent {
         }
     }
 }
+
+
+/// Points the system resolver at MacDPI's local DNS server.
+///
+/// Apps that resolve names themselves (Roblox's client, for one) never reach
+/// the proxy, so a network that drops plain DNS for blocked names stops them at
+/// "DnsResolve". Answering their lookups over DoH fixes that. Only 127.0.0.1 is
+/// set - not a pinned copy of the network's own servers, which would go stale on
+/// the next network - because the engine falls back to whatever DHCP handed out.
+enum SystemDNS {
+    /// True when the resolver macOS consults first is our loopback server.
+    static func isPointedAtUs() -> Bool {
+        let out = shell("/usr/sbin/scutil", ["--dns"])
+        for line in out.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("nameserver[0]") { return t.hasSuffix("127.0.0.1") }
+        }
+        return false
+    }
+
+    static func setEnabled(_ enabled: Bool) -> Bool {
+        let names = SystemProxy.services()
+        guard !names.isEmpty else { return false }
+        let parts = names.map { name -> String in
+            let service = shellQuote(name)
+            return enabled
+                ? "/usr/sbin/networksetup -setdnsservers \(service) 127.0.0.1"
+                : "/usr/sbin/networksetup -setdnsservers \(service) Empty"
+        } + ["/usr/bin/dscacheutil -flushcache", "/usr/bin/killall -HUP mDNSResponder"]
+        let reason = enabled
+            ? "MacDPI needs your password to send this Mac's DNS lookups through it."
+            : "MacDPI needs your password to restore your normal DNS settings."
+        return runPrivileged(parts.joined(separator: "; "), reason: reason)
+    }
+}

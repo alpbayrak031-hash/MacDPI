@@ -98,6 +98,9 @@ class Context:
     # Route-only mode: run ONLY the Minecraft route listener (its own process,
     # its own event loop), so the cover-all-apps web flood can't starve it.
     minecraft_route: bool = False
+    # Answer the Mac's own DNS lookups over DoH (see dnsserver.py).
+    dns_server: bool = False
+    dns_port: int = 53
     tproxy_tls_port: int = 8443
     tproxy_http_port: int = 8480
     # A third transparent listener for raw, non-HTTP TCP protocols that are
@@ -175,6 +178,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tproxy-raw-port", type=int, default=8425,
                    help="transparent listener port for redirected raw TCP "
                         "(Minecraft) (default: %(default)s)")
+    p.add_argument("--dns-server", action="store_true",
+                   help="also run a local DNS server that answers over DoH, for "
+                        "apps that resolve names themselves (point the system "
+                        "resolver at 127.0.0.1)")
+    p.add_argument("--dns-port", type=int, default=53,
+                   help="port for --dns-server (default: %(default)s)")
     p.add_argument("--minecraft-route", action="store_true",
                    help="run ONLY the Minecraft route listener (a dedicated,\n"
                         "lightweight process the game-route agent connects to)")
@@ -205,6 +214,8 @@ def context_from_args(args) -> Context:
         tproxy_http_port=args.tproxy_http_port,
         tproxy_raw_port=args.tproxy_raw_port,
         minecraft_route=args.minecraft_route,
+        dns_server=args.dns_server,
+        dns_port=args.dns_port,
     )
     mc = args.minecraft_ports.strip().lower()
     if mc in ("off", "no", "none", ""):

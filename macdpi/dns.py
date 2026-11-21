@@ -405,7 +405,10 @@ class Resolver:
         return _Conn(stream, provider, strategy)
 
     async def _query_raw(self, conn, name: str, qtype: int) -> bytes:
-        body = encode_query(name, qtype)
+        return await self._post(conn, encode_query(name, qtype))
+
+    async def _post(self, conn, body: bytes) -> bytes:
+        """POST one wire-format DNS message over `conn`; return the reply."""
         _ip, dhost, dpath = conn.provider
         req = (
             f"POST {dpath} HTTP/1.1\r\n"
@@ -437,6 +440,32 @@ class Resolver:
         except (IndexError, struct.error) as exc:
             raise _ProviderError("malformed DNS answer") from exc
         return ips
+
+    async def doh_wire(self, query: bytes) -> bytes:
+        """Answer an arbitrary DNS query (wire format in, wire format out) over DoH.
+
+        This is what lets MacDPI stand in for the system's own resolver: apps
+        such as Roblox's client resolve names themselves before any proxy is
+        involved, and a network that drops plain DNS for blocked names breaks
+        them there. Raises if no DoH provider answers.
+        """
+        if self._slots is None:
+            self._slots = asyncio.Semaphore(DOH_CONNECTIONS)
+        async with self._slots:
+            last = None
+            for _attempt in range(3):
+                conn = await self._checkout()
+                try:
+                    reply = await self._post(conn, query)
+                except _RETRYABLE as exc:
+                    last = exc
+                    conn.close()
+                    if conn.fresh:
+                        self._demote(conn.provider, exc)
+                    continue
+                self._checkin(conn)
+                return reply
+            raise last or ConnectionError("DoH query failed")
 
     async def resolve_srv(self, name: str):
         """Resolve an SRV record. Returns (host, port) sorted best-first, or []."""

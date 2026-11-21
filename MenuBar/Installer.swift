@@ -5,7 +5,7 @@ import Foundation
 enum Installer {
     /// The command line the engine job should run for this build of the app.
     static func engineArguments(python: String, port: Int,
-                                transparent: Bool) -> [String] {
+                                transparent: Bool, dns: Bool = false) -> [String] {
         var args = [python] + Paths.pythonOptions + [
             "-m", "macdpi",
             "--port", String(port),
@@ -16,17 +16,25 @@ enum Installer {
             // Also open the transparent listeners the pf redirect feeds.
             args.append("--transparent")
         }
+        if dns {
+            // Also answer this Mac's own DNS lookups over DoH, for apps that
+            // resolve names themselves before any proxy is involved.
+            args.append("--dns-server")
+        }
         return args
     }
 
-    static func installEngineAgent(port: Int = 8881, transparent: Bool = false) {
+    static func installEngineAgent(port: Int = 8881, transparent: Bool = false,
+                                   dns: Bool? = nil) {
+        // Unless told otherwise, keep whatever the installed job already had.
+        let dns = dns ?? engineAgentHasDNS()
         guard let python = Paths.findPython() else { return }
         try? FileManager.default.createDirectory(
             atPath: Paths.stateDir, withIntermediateDirectories: true)
         LaunchAgent.write(
             label: LaunchAgent.engineLabel,
             programArguments: engineArguments(python: python, port: port,
-                                              transparent: transparent),
+                                              transparent: transparent, dns: dns),
             workingDirectory: Paths.engineDir,
             logPath: Paths.logPath,
             keepAlive: true,
@@ -67,6 +75,12 @@ enum Installer {
     static func engineAgentIsTransparent() -> Bool {
         let args = job(LaunchAgent.engineLabel)?["ProgramArguments"] as? [String]
         return args?.contains("--transparent") ?? false
+    }
+
+    /// Whether the installed engine agent currently carries --dns-server.
+    static func engineAgentHasDNS() -> Bool {
+        let args = job(LaunchAgent.engineLabel)?["ProgramArguments"] as? [String]
+        return args?.contains("--dns-server") ?? false
     }
 
     static func installMenuBarAgent() {
@@ -128,6 +142,7 @@ enum Installer {
         // Carry over what the user had: the port, and whether "all apps" is on.
         let installed = engine["ProgramArguments"] as? [String] ?? []
         let transparent = installed.contains("--transparent")
+        let dns = installed.contains("--dns-server")
         var port = 8881
         if let flag = installed.firstIndex(of: "--port"), flag + 1 < installed.count,
            let value = Int(installed[flag + 1]) {
@@ -137,13 +152,13 @@ enum Installer {
         var stale = (engine["WorkingDirectory"] as? String) != Paths.engineDir
         if let python = Paths.findPython(),
            installed != engineArguments(python: python, port: port,
-                                        transparent: transparent) {
+                                        transparent: transparent, dns: dns) {
             stale = true
         }
         let outdated = EngineStatus.fetch().map { $0.version != AppVersion.current } ?? false
 
         if stale {
-            installEngineAgent(port: port, transparent: transparent)
+            installEngineAgent(port: port, transparent: transparent, dns: dns)
         }
         if stale || outdated {
             if !LaunchAgent.reload(LaunchAgent.engineLabel) {

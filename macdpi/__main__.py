@@ -9,6 +9,7 @@ from . import __version__, netcheck, probe
 from .config import Log, build_parser, context_from_args
 from .control import ControlServer
 from .dns import Resolver
+from .dnsserver import DnsServer
 from .proxy import Proxy
 
 
@@ -84,12 +85,21 @@ async def serve(ctx, log):
     # starve it - which is exactly what made game joins time out when it shared
     # this loop.
 
+    dns_server = None
+    if ctx.dns_server:
+        dns_server = DnsServer(ctx, resolver, log)
+        try:
+            await dns_server.start()
+        except OSError as exc:
+            log.error(f"cannot start DNS server on port {ctx.dns_port}: {exc}")
+            dns_server = None
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
-    control = ControlServer(ctx, prox, resolver, log, stop)
+    control = ControlServer(ctx, prox, resolver, log, stop, dns_server)
     try:
         await control.start()
     except OSError as exc:
@@ -117,6 +127,8 @@ async def serve(ctx, log):
              f"{prox.stats['failed']} failed)")
     for srv in tproxy_servers:
         srv.close()
+    if dns_server:
+        await dns_server.close()
     for task in tasks:
         task.cancel()
     await control.close()

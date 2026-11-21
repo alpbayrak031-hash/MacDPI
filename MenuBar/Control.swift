@@ -77,6 +77,7 @@ struct EngineStatus {
     var strategies: [String: Int] = [:]
     var transparent = false
     var bypassCount = 0
+    var dnsServer = false
 
     static func fetch() -> EngineStatus? {
         guard let reply = Control.call(["cmd": "status"]),
@@ -96,6 +97,7 @@ struct EngineStatus {
         status.strategies = reply["strategies"] as? [String: Int] ?? [:]
         status.transparent = reply["transparent"] as? Bool ?? false
         status.bypassCount = reply["bypass_count"] as? Int ?? 0
+        status.dnsServer = reply["dns_server"] as? Bool ?? false
         return status
     }
 }

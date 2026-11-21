@@ -198,7 +198,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// macOS is routed through a proxy that is not answering, which means no
     /// browser on this Mac can load anything. Say so, and offer the way out.
     private func checkForOutage() {
-        guard proxyOn, status == nil else {
+        // Dead engine + system routed at it = nothing loads. That is true of the
+        // proxy and, now, of DNS pointed at the engine's DNS server.
+        guard status == nil, proxyOn || SystemDNS.isPointedAtUs() else {
             outageChecks = 0
             warnedAboutOutage = false
             return
@@ -233,7 +235,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .alertFirstButtonReturn:
             restartEngine()
         case .alertSecondButtonReturn:
-            _ = SystemProxy.setEnabled(false, port: port)
+            if SystemDNS.isPointedAtUs() { _ = SystemDNS.setEnabled(false) }
+            if proxyOn { _ = SystemProxy.setEnabled(false, port: port) }
             refresh()
         default:
             break
@@ -316,6 +319,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 excl.target = self
                 menu.addItem(excl)
             }
+
+            let dnsOn = st.dnsServer && SystemDNS.isPointedAtUs()
+            let dns = NSMenuItem(title: "Fix DNS for Apps That Ignore the Proxy",
+                                 action: #selector(toggleDNS), keyEquivalent: "")
+            dns.target = self
+            dns.state = dnsOn ? .on : .off
+            dns.toolTip = "Answers this Mac's own DNS lookups over DoH, for apps "
+                + "(like Roblox) that resolve names themselves and fail with "
+                + "\"DnsResolve\" on a network that blocks plain DNS."
+            menu.addItem(dns)
 
             menu.addItem(strategyMenuItem())
             menu.addItem(recentMenuItem())
@@ -448,6 +461,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         if SystemProxy.setEnabled(wanted, port: port) {
+            refresh()
+        }
+    }
+
+    @objc private func toggleDNS() {
+        if status?.dnsServer == true && SystemDNS.isPointedAtUs() {
+            disableDNS()
+        } else {
+            enableDNS()
+        }
+    }
+
+    private func disableDNS() {
+        guard SystemDNS.setEnabled(false) else { return }        // password cancelled
+        Installer.installEngineAgent(transparent: Installer.engineAgentIsTransparent(),
+                                     dns: false)
+        bringEngineUp()
+        refresh()
+    }
+
+    private func enableDNS() {
+        guard status != nil else {
+            alert("The engine is not running",
+                  "Start the engine first, then turn this on.")
+            return
+        }
+        let intro = NSAlert()
+        intro.messageText = "Fix DNS for apps that ignore the proxy?"
+        intro.informativeText = """
+        Some apps - Roblox's, for one - look up names themselves before they \
+        connect, so they never reach MacDPI's proxy. On a network that blocks plain \
+        DNS for certain sites they stop at "DnsResolve".
+
+        This makes MacDPI answer this Mac's DNS lookups over DNS-over-HTTPS. If \
+        that ever fails it falls back to the network's own DNS. You'll be asked \
+        for your password once.
+        """
+        intro.addButton(withTitle: "Turn On")
+        intro.addButton(withTitle: "Cancel")
+        guard intro.runModal() == .alertFirstButtonReturn else { return }
+
+        // The engine has to be answering before macOS is pointed at it.
+        Installer.installEngineAgent(transparent: Installer.engineAgentIsTransparent(),
+                                     dns: true)
+        bringEngineUp()
+        guard status?.dnsServer == true else {
+            alert("Could not start the DNS server",
+                  "The engine did not start its DNS server, so nothing was changed.")
+            return
+        }
+        guard SystemDNS.setEnabled(true) else { return }          // password cancelled
+
+        // Prove it works before leaving it on: a blocked name must now resolve.
+        // If it does not, put DNS back rather than strand the Mac on a bad resolver.
+        let probe = shell("/usr/bin/dscacheutil",
+                          ["-q", "host", "-a", "name", "clientsettingscdn.roblox.com"])
+        if probe.contains("ip_address") {
+            refresh()
+            alert("DNS is fixed",
+                  "This Mac's DNS lookups now go through MacDPI. Reopen the app that "
+                  + "was failing.")
+        } else {
+            _ = SystemDNS.setEnabled(false)
+            alert("DNS test failed",
+                  "Lookups through MacDPI did not work, so your DNS settings were put "
+                  + "back as they were.")
             refresh()
         }
     }
@@ -684,6 +763,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if SystemProxy.isEnabled(port: port) {
             _ = SystemProxy.setEnabled(false, port: port)
+        }
+        if SystemDNS.isPointedAtUs() {
+            _ = SystemDNS.setEnabled(false)
         }
         LaunchAgent.remove(LaunchAgent.engineLabel)
         LaunchAgent.remove(LaunchAgent.barLabel)

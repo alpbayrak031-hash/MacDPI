@@ -56,7 +56,8 @@ def _make_client_hello(hostname: str) -> bytes:
 
 
 class ControlServer:
-    def __init__(self, ctx, proxy, resolver, log, stop):
+    def __init__(self, ctx, proxy, resolver, log, stop, dns_server=None):
+        self.dns_server = dns_server
         self.ctx = ctx
         self.proxy = proxy
         self.resolver = resolver
@@ -142,6 +143,8 @@ class ControlServer:
             "tproxy_tls_port": self.ctx.tproxy_tls_port,
             "tproxy_http_port": self.ctx.tproxy_http_port,
             "minecraft_ports": self.ctx.mc_ports,
+            "dns_server": self.dns_server is not None,
+            "dns_stats": self.dns_server.stats if self.dns_server else None,
             "bypass_count": len(_load_bypass()),
         }
 
