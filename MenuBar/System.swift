@@ -306,7 +306,7 @@ enum SystemDNS {
         return false
     }
 
-    static func setEnabled(_ enabled: Bool) -> Bool {
+    static func setEnabled(_ enabled: Bool, reason customReason: String? = nil) -> Bool {
         let names = SystemProxy.services()
         guard !names.isEmpty else { return false }
         let parts = names.map { name -> String in
@@ -318,6 +318,6 @@ enum SystemDNS {
         let reason = enabled
             ? "MacDPI needs your password to send this Mac's DNS lookups through it."
             : "MacDPI needs your password to restore your normal DNS settings."
-        return runPrivileged(parts.joined(separator: "; "), reason: reason)
+        return runPrivileged(parts.joined(separator: "; "), reason: customReason ?? reason)
     }
 }

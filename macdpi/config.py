@@ -100,6 +100,8 @@ class Context:
     minecraft_route: bool = False
     # Answer the Mac's own DNS lookups over DoH (see dnsserver.py).
     dns_server: bool = False
+    # Let the engine's self-check restart it (only meaningful under launchd).
+    watchdog: bool = False
     dns_port: int = 53
     tproxy_tls_port: int = 8443
     tproxy_http_port: int = 8480
@@ -182,6 +184,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also run a local DNS server that answers over DoH, for "
                         "apps that resolve names themselves (point the system "
                         "resolver at 127.0.0.1)")
+    p.add_argument("--watchdog", action="store_true",
+                   help="let the engine's self-check restart it when it is "
+                        "wedged or out of resources (use under launchd, which "
+                        "relaunches it)")
     p.add_argument("--dns-port", type=int, default=53,
                    help="port for --dns-server (default: %(default)s)")
     p.add_argument("--minecraft-route", action="store_true",
@@ -215,6 +221,7 @@ def context_from_args(args) -> Context:
         tproxy_raw_port=args.tproxy_raw_port,
         minecraft_route=args.minecraft_route,
         dns_server=args.dns_server,
+        watchdog=args.watchdog,
         dns_port=args.dns_port,
     )
     mc = args.minecraft_ports.strip().lower()

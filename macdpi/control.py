@@ -56,7 +56,8 @@ def _make_client_hello(hostname: str) -> bytes:
 
 
 class ControlServer:
-    def __init__(self, ctx, proxy, resolver, log, stop, dns_server=None):
+    def __init__(self, ctx, proxy, resolver, log, stop, dns_server=None, doctor=None):
+        self.doctor = doctor
         self.dns_server = dns_server
         self.ctx = ctx
         self.proxy = proxy
@@ -147,6 +148,18 @@ class ControlServer:
             "dns_stats": self.dns_server.stats if self.dns_server else None,
             "bypass_count": len(_load_bypass()),
         }
+
+    def _cmd_health(self, _request):
+        """The engine's own view of its health (see doctor.py)."""
+        if self.doctor is None:
+            return {"ok": True, "health": None}
+        return {"ok": True, "health": self.doctor.report()}
+
+    async def _cmd_dns_probe(self, _request):
+        """Is plain DNS being blocked for names DoH can resolve? (see doctor.py)"""
+        if self.doctor is None:
+            return {"ok": True, "blocked": [], "checked": 0}
+        return {"ok": True, **(await self.doctor.dns_probe())}
 
     def _cmd_get_bypass(self, _request):
         return {"ok": True, "bypass": _load_bypass()}

@@ -81,6 +81,14 @@ That's the whole install — there's nothing to install alongside it.
   *every* app's web traffic, not just proxy-aware ones. Fail-safe (see below).
 - 🚫 **Exclusion list** — keep specific sites/IPs off the path (banks, work VPNs).
 - ♻️ **Starts at login**, survives sleep/network changes, self-heals if moved.
+- 🩺 **Fixes itself** — the engine checks its own listeners, event loop, file
+  descriptors, memory and DoH every 10 s and restarts itself (within a budget)
+  when wedged; the app checks the launch jobs, the engine, firewall and DNS
+  settings every 30 s and repairs what it can without a password.
+  **Run Diagnostics…** shows a full report.
+- 🧭 **DNS fix as an automatic fallback** — it notices when a network blocks
+  plain DNS for names DoH can resolve, offers the fix once, and from then on
+  switches it on by itself whenever a network does that.
 - 🔒 **No root for the network path** — the proxy runs as your user; only
   changing the system proxy / firewall asks for a password.
 

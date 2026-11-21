@@ -11,6 +11,9 @@ enum Installer {
             "--port", String(port),
             // Wait for a route at login instead of failing lookups in a burst.
             "--wait-for-network", "300",
+            // Under launchd the engine may restart itself when its own checks
+            // say it is wedged or out of resources (see macdpi/doctor.py).
+            "--watchdog",
         ]
         if transparent {
             // Also open the transparent listeners the pf redirect feeds.

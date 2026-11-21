@@ -45,6 +45,9 @@ Opening it shows live state and the controls:
 - **Test This Network** — runs the full probe grid and shows the results
 - **Flush DNS Cache**, **Forget Learned Strategies**, **Open Log**,
   **Restart Engine**
+- **Run Diagnostics** — runs every self-check, repairs what it safely can, and
+  shows a report (what was wrong, what it fixed, the engine's own health and
+  recent events). A line above it says what the app last fixed by itself.
 - **Start at Login**, and **Remove MacDPI**, which puts your network settings
   back and unloads everything
 
@@ -53,6 +56,57 @@ notices within about ten seconds and offers to restart it or turn protection
 off. That state — routed through a proxy that is not answering — is the one way
 this tool can leave you with no working browser at all, so it is worth catching
 loudly rather than leaving you to wonder why nothing loads.
+
+## Fixing itself
+
+MacDPI checks itself continuously and repairs what it can without asking, so a
+broken state does not mean a reinstall. There are two halves.
+
+**The engine watches itself** (`macdpi/doctor.py`, enabled with `--watchdog`,
+which the app always passes). Every ten seconds it connects to each of its own
+listeners, times its event loop, counts its open descriptors and its memory,
+and resolves a canary name over DoH. Three failed rounds in a row of anything
+that a restart cures (a listener gone, a stalled loop, descriptors or memory
+nearly exhausted, its DNS server not answering) and it exits so launchd starts
+a fresh one. A separate heartbeat thread covers the case the loop cannot see
+itself: if the loop has not run for thirty seconds, the thread ends the
+process. DoH that keeps failing gets its resolver state cleared instead.
+Restarts are budgeted - three in fifteen minutes - because a fault a restart
+does not cure would otherwise become a crash loop; once the budget is spent the
+engine stays up, marks itself degraded, and says why. Events go to
+`~/.macdpi/doctor.log`. Run in the foreground without `--watchdog`, it reports
+problems but never restarts itself.
+
+**The app watches the setup around the engine** (`MenuBar/Doctor.swift`),
+every thirty seconds, and fixes without a password:
+
+- a launch job that is missing or was never loaded, or an engine that is not
+  answering (with launchd's last exit code and the log tail if a restart does
+  not help)
+- an engine older than the app, left behind by an update
+- the download quarantine flag, which stops launchd running the bundled Python
+- DNS pointed at MacDPI while the engine's DNS server is off
+- the all-apps firewall rule loaded with no matching listeners (which drops
+  web traffic)
+- an engine log over 20 MB
+
+Each fix also has a budget: one that keeps being needed is not working, so after
+three tries in fifteen minutes it stops and tells you, instead of looping. It
+leaves you alone for half a minute after anything you do yourself, and stops
+for good the moment you choose Remove MacDPI. Fixes that need your password -
+the system proxy or DNS still pointed at a dead engine - are offered, never
+done silently.
+
+**DNS fix as an automatic fallback.** The doctor also notices when a network
+blocks plain DNS: it resolves a few commonly blocked names both through the
+system resolver and over DoH, and names that only DoH can resolve mean apps
+that look names up themselves (Roblox's, for one) will fail. The first time, it
+offers "Fix DNS for Apps That Ignore the Proxy". Once you have said yes, it is
+your fallback from then on: whenever a network blocks DNS, MacDPI switches the
+fix on by itself, and the only thing you see is macOS's password prompt
+(changing DNS needs admin rights, so this cannot be silent). Turning the fix
+off by hand stops it switching itself back on; "Don't Ask Again" stops the
+offer.
 
 ## Covering every app, not just browsers
 
@@ -339,6 +393,7 @@ Useful options to `start`:
     --port 8881       change the listen port
 -v, --verbose         log every connection and the strategy it used
     --dns-server             answer this Mac's DNS lookups over DoH (see above)
+    --watchdog               let the self-check restart the engine (under launchd)
     --minecraft-ports 25565  TCP ports covered as Minecraft Java, or 'off'
     --wait-for-network 300   wait N seconds for a connection before serving
     --no-watch-network       do not flush DNS when the connection returns
@@ -378,6 +433,7 @@ MenuBar/Control.swift client for the engine's control socket
 MenuBar/System.swift  system proxy and launchd handling
 MenuBar/Paths.swift   locating a Python that actually runs
 MenuBar/Installer.swift  writing and repairing the launchd jobs
+MenuBar/Doctor.swift  the app's self-check and automatic repairs
 build.sh              builds the universal, self-contained MacDPI.app
 
 macdpi/tls.py         ClientHello parsing, TLS record re-framing
@@ -393,6 +449,7 @@ macdpi/transparent... transparent routing lives in proxy.handle_transparent
 macdpi/pfgen.py       generates the pf ruleset for 'cover all apps'
 macdpi/mcproto.py     parses the Minecraft handshake for transparent routing
 macdpi/dnsserver.py    local DNS server that answers over DoH (system-DNS fix)
+macdpi/doctor.py      the engine's self-check, watchdog and restart budget
 macdpi/probe.py       the --test report
 macdpi/config.py      options and logging
 dpictl                start/stop, system proxy, autostart

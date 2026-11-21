@@ -10,6 +10,7 @@ from .config import Log, build_parser, context_from_args
 from .control import ControlServer
 from .dns import Resolver
 from .dnsserver import DnsServer
+from .doctor import Doctor, EXIT_RESTART
 from .proxy import Proxy
 
 
@@ -63,16 +64,27 @@ async def serve(ctx, log):
     log.info("point macOS system proxy here, or run: ./dpictl on")
 
     tproxy_servers = []
+    tproxy_checks = []          # (name, server or None) for the self-check
     if ctx.transparent:
-        for tport, uport in ((ctx.tproxy_tls_port, 443),
-                             (ctx.tproxy_http_port, 80)):
+        for name, tport, uport in (("transparent-tls", ctx.tproxy_tls_port, 443),
+                                   ("transparent-http", ctx.tproxy_http_port, 80)):
             handler = _make_transparent_handler(prox, uport)
-            try:
-                srv = await asyncio.start_server(
-                    handler, "127.0.0.1", tport, reuse_address=True, backlog=512
-                )
-            except OSError as exc:
-                log.error(f"cannot open transparent listener on {tport}: {exc}")
+            srv = None
+            # Right after a restart the previous engine may still hold the port
+            # for a moment; retry briefly rather than run without the listener.
+            for attempt in range(20):
+                try:
+                    srv = await asyncio.start_server(
+                        handler, "127.0.0.1", tport, reuse_address=True, backlog=512
+                    )
+                    break
+                except OSError as exc:
+                    if attempt == 19:
+                        log.error(f"cannot open transparent listener on {tport}: {exc}")
+                    else:
+                        await asyncio.sleep(0.5)
+            tproxy_checks.append((name, srv))
+            if srv is None:
                 continue
             tproxy_servers.append(srv)
             log.info(f"transparent listener on 127.0.0.1:{tport} "
@@ -99,13 +111,22 @@ async def serve(ctx, log):
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
-    control = ControlServer(ctx, prox, resolver, log, stop, dns_server)
+    # The proxy port is checked by connecting to it. The transparent ones are
+    # checked through their server objects instead: they are pf's redirect
+    # targets, and macOS pf can mangle a direct loopback connect to such a
+    # port, which would make a healthy engine look broken.
+    listeners = [("proxy", ctx.port)] + tproxy_checks
+    doctor = Doctor(ctx, log, stop, resolver, listeners, dns_server,
+                    can_restart=ctx.watchdog)
+
+    control = ControlServer(ctx, prox, resolver, log, stop, dns_server, doctor)
     try:
         await control.start()
     except OSError as exc:
         log.warn(f"control socket unavailable: {exc}")
 
-    tasks = [asyncio.create_task(_periodic_save(prox, stop))]
+    tasks = [asyncio.create_task(_periodic_save(prox, stop)),
+             doctor.start(loop)]
     if ctx.wait_for_network > 0:
         # Background only: the listeners are already up. This just notes when
         # the connection is really ready (handy in the log) and lets the
@@ -133,6 +154,7 @@ async def serve(ctx, log):
         task.cancel()
     await control.close()
     prox.save_state()
+    return doctor.restart_reason
 
 
 async def _serve_minecraft_route(ctx, log, resolver, prox):

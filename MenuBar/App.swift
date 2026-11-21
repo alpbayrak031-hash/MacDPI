@@ -38,6 +38,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
 
+        Doctor.shared.onOfferDNSFix = { [weak self] blocked in self?.offerDNSFix(blocked) }
+        Doctor.shared.onNeedsAttention = { [weak self] message in self?.doctorNeedsAttention(message) }
+        Doctor.shared.start()
+
         refresh()
         if !Installer.isConfigured {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.runFirstRunSetup() }
@@ -340,6 +344,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        let health = Doctor.shared.summary
+        if !health.isEmpty { addDetail(health) }
+        addAction("Run Diagnostics…", #selector(runDiagnostics))
         addAction("Test This Network…", #selector(runNetworkTest))
         if status != nil {
             addAction("Flush DNS Cache", #selector(flushDNS))
@@ -454,6 +461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - actions
 
     @objc private func toggleProtection() {
+        Doctor.shared.userActed()
         let wanted = !proxyOn
         if wanted && status == nil {
             alert("The engine is not running",
@@ -465,7 +473,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// The Doctor found plain DNS being blocked. Offer the fix at the moment it
+    /// matters, rather than waiting for the user to find the menu item.
+    private func offerDNSFix(_ blocked: [String]) {
+        let sites = blocked.prefix(3).joined(separator: ", ")
+        // Approved before: this is the automatic fallback. Go straight to
+        // switching it on; the only prompt is macOS's own password box.
+        if Doctor.shared.dnsAutoFallback {
+            Doctor.shared.userActed()
+            let reason = "This network is blocking DNS for \(sites). MacDPI needs your "
+                + "password to switch on its DNS fix automatically."
+            if enableDNS(confirm: false, announce: false, reason: reason) {
+                Doctor.shared.recordFix("switched the DNS fix on (this network blocks \(sites))")
+                refresh()
+            } else {
+                Doctor.shared.deferDNSOffer()         // cancelled or failed: not again for a while
+            }
+            return
+        }
+        let box = NSAlert()
+        box.messageText = "This network is blocking DNS lookups"
+        box.informativeText = """
+        Lookups for \(sites) fail on this network, so apps that look names up \
+        themselves - Roblox, for one - won't be able to start, even though your \
+        browser works through MacDPI.
+
+        MacDPI can answer those lookups over DNS-over-HTTPS instead, and falls \
+        back to the network's own DNS if it ever can't answer. From then on it \
+        switches this on by itself whenever a network blocks DNS (you'll only see \
+        the password prompt).
+        """
+        box.addButton(withTitle: "Fix It")
+        box.addButton(withTitle: "Not Now")
+        box.addButton(withTitle: "Don't Ask Again")
+        switch box.runModal() {
+        case .alertFirstButtonReturn:
+            Doctor.shared.userActed()
+            if !enableDNS(confirm: false) { Doctor.shared.deferDNSOffer() }
+        case .alertThirdButtonReturn:
+            Doctor.shared.neverOfferDNSFix()
+        default:
+            Doctor.shared.deferDNSOffer()
+        }
+    }
+
+    private func doctorNeedsAttention(_ message: String) {
+        // The "routed through a dead MacDPI" case already has its own dialog,
+        // with the password-needing buttons, in checkForOutage().
+        if message.hasPrefix("Your Mac is routed") { return }
+        let box = NSAlert()
+        box.messageText = "MacDPI found a problem it could not fix itself"
+        box.informativeText = message
+        box.addButton(withTitle: "Show Diagnostics")
+        box.addButton(withTitle: "Dismiss")
+        if box.runModal() == .alertFirstButtonReturn { runDiagnostics() }
+    }
+
+    @objc private func runDiagnostics() {
+        Doctor.shared.userActed()
+        DispatchQueue.global().async {
+            let findings = Doctor.shared.diagnose(fix: true, deep: true)
+            let text = Doctor.shared.reportText(findings)
+            DispatchQueue.main.async {
+                self.refresh()
+                self.showText(title: "MacDPI diagnostics", body: text)
+            }
+        }
+    }
+
     @objc private func toggleDNS() {
+        Doctor.shared.userActed()
         if status?.dnsServer == true && SystemDNS.isPointedAtUs() {
             disableDNS()
         } else {
@@ -475,18 +552,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func disableDNS() {
         guard SystemDNS.setEnabled(false) else { return }        // password cancelled
+        // Turned off by hand: stop switching it back on automatically.
+        Doctor.shared.dnsAutoFallback = false
+        Doctor.shared.deferDNSOffer()
         Installer.installEngineAgent(transparent: Installer.engineAgentIsTransparent(),
                                      dns: false)
         bringEngineUp()
         refresh()
     }
 
-    private func enableDNS() {
+    @discardableResult
+    private func enableDNS(confirm: Bool = true, announce: Bool = true, reason: String? = nil) -> Bool {
         guard status != nil else {
-            alert("The engine is not running",
-                  "Start the engine first, then turn this on.")
-            return
+            if announce {
+                alert("The engine is not running",
+                      "Start the engine first, then turn this on.")
+            }
+            return false
         }
+        if confirm {
         let intro = NSAlert()
         intro.messageText = "Fix DNS for apps that ignore the proxy?"
         intro.informativeText = """
@@ -500,38 +584,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         """
         intro.addButton(withTitle: "Turn On")
         intro.addButton(withTitle: "Cancel")
-        guard intro.runModal() == .alertFirstButtonReturn else { return }
+        guard intro.runModal() == .alertFirstButtonReturn else { return false }
+        }
 
         // The engine has to be answering before macOS is pointed at it.
         Installer.installEngineAgent(transparent: Installer.engineAgentIsTransparent(),
                                      dns: true)
         bringEngineUp()
         guard status?.dnsServer == true else {
-            alert("Could not start the DNS server",
-                  "The engine did not start its DNS server, so nothing was changed.")
-            return
+            if announce {
+                alert("Could not start the DNS server",
+                      "The engine did not start its DNS server, so nothing was changed.")
+            }
+            return false
         }
-        guard SystemDNS.setEnabled(true) else { return }          // password cancelled
+        guard SystemDNS.setEnabled(true, reason: reason) else { return false }   // password cancelled
 
         // Prove it works before leaving it on: a blocked name must now resolve.
         // If it does not, put DNS back rather than strand the Mac on a bad resolver.
         let probe = shell("/usr/bin/dscacheutil",
                           ["-q", "host", "-a", "name", "clientsettingscdn.roblox.com"])
         if probe.contains("ip_address") {
+            Doctor.shared.dnsAutoFallback = true
             refresh()
-            alert("DNS is fixed",
-                  "This Mac's DNS lookups now go through MacDPI. Reopen the app that "
-                  + "was failing.")
-        } else {
-            _ = SystemDNS.setEnabled(false)
-            alert("DNS test failed",
-                  "Lookups through MacDPI did not work, so your DNS settings were put "
-                  + "back as they were.")
-            refresh()
+            if announce {
+                alert("DNS is fixed",
+                      "This Mac's DNS lookups now go through MacDPI. Reopen the app that "
+                      + "was failing. From now on MacDPI switches this on by itself "
+                      + "whenever a network blocks DNS.")
+            }
+            return true
         }
+        _ = SystemDNS.setEnabled(false)
+        alert("DNS test failed",
+              "Lookups through MacDPI did not work, so your DNS settings were put "
+              + "back as they were.")
+        refresh()
+        return false
     }
 
     @objc private func toggleAllApps() {
+        Doctor.shared.userActed()
         let currentlyOn = (status?.transparent ?? false) && Transparent.daemonInstalled()
         if currentlyOn {
             disableAllApps()
@@ -676,6 +769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func restartEngine() {
+        Doctor.shared.userActed()
         bringEngineUp()
     }
 
@@ -758,6 +852,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         confirm.addButton(withTitle: "Cancel")
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
+        // A removal must stay removed: stop the doctor before it can "repair" it.
+        Doctor.shared.stop()
         if Transparent.daemonInstalled() {
             _ = Transparent.disable()
         }
